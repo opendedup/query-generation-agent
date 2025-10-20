@@ -1,0 +1,50 @@
+[tool.poetry]
+name = "query-generation-agent"
+version = "0.1.0"
+description = "MCP service that generates and validates BigQuery SQL queries from data science insights"
+authors = ["Your Name <you@example.com>"]
+readme = "README.md"
+packages = [{include = "query_generation_agent", from = "src"}]
+
+[tool.poetry.dependencies]
+python = ">=3.10,<3.13"
+python-dotenv = "^1.0.0"
+pydantic = "^2.0.0"
+google-cloud-bigquery = "^3.11.0"
+google-generativeai = "^0.8.0"
+mcp = "^1.0.0"
+fastapi = "^0.115.0"
+uvicorn = {extras = ["standard"], version = "^0.32.0"}
+httpx = "^0.27.0"
+sqlparse = "^0.5.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^7.4.0"
+pytest-asyncio = "^0.21.0"
+pytest-mock = "^3.11.0"
+pytest-cov = "^4.1.0"
+freezegun = "^1.2.0"
+responses = "^0.23.0"
+black = "^23.0.0"
+ruff = "^0.1.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.black]
+line-length = 100
+target-version = ['py310', 'py311', 'py312']
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+asyncio_mode = "auto"
+
+
