@@ -64,7 +64,7 @@ EXPOSE 8081
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8081/health || exit 1
 
-# Default to HTTP server
-# Can be overridden to run stdio server
-CMD ["python", "-m", "query_generation_agent.mcp.http_server"]
+# Default to HTTP transport (controlled by MCP_TRANSPORT env var)
+# Set MCP_TRANSPORT=stdio to run stdio server instead
+CMD ["python", "-m", "query_generation_agent.mcp"]
 

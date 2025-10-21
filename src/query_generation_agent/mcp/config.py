@@ -39,6 +39,13 @@ class QueryGenerationConfig(BaseModel):
     mcp_host: str = Field(default="0.0.0.0", description="HTTP host address")
     mcp_port: int = Field(default=8081, description="HTTP port")
     
+    # Authentication Configuration
+    mcp_auth_enabled: bool = Field(default=False, description="Enable HTTP authentication")
+    mcp_auth_mode: str = Field(default="api_key", description="Auth mode (api_key/jwt/gateway)")
+    mcp_api_key: Optional[str] = Field(default=None, description="API key for authentication")
+    jwt_secret: Optional[str] = Field(default=None, description="JWT secret for token validation")
+    jwt_algorithm: str = Field(default="HS256", description="JWT algorithm")
+    
     # Optional Configuration
     log_level: str = Field(default="INFO", description="Logging level")
     enable_validation_logging: bool = Field(default=True, description="Enable validation logs")
@@ -68,6 +75,15 @@ class QueryGenerationConfig(BaseModel):
         if v.upper() not in valid_levels:
             raise ValueError(f"log_level must be one of: {', '.join(valid_levels)}")
         return v.upper()
+    
+    @field_validator("mcp_auth_mode")
+    @classmethod
+    def validate_auth_mode(cls, v: str) -> str:
+        """Validate authentication mode."""
+        valid_modes = ["api_key", "jwt", "gateway"]
+        if v not in valid_modes:
+            raise ValueError(f"mcp_auth_mode must be one of: {', '.join(valid_modes)}")
+        return v
 
 
 def load_config() -> QueryGenerationConfig:
@@ -110,6 +126,11 @@ def load_config() -> QueryGenerationConfig:
         mcp_transport=os.getenv("MCP_TRANSPORT", "stdio"),
         mcp_host=os.getenv("MCP_HOST", "0.0.0.0"),
         mcp_port=int(os.getenv("MCP_PORT", "8081")),
+        mcp_auth_enabled=os.getenv("MCP_AUTH_ENABLED", "false").lower() == "true",
+        mcp_auth_mode=os.getenv("MCP_AUTH_MODE", "api_key"),
+        mcp_api_key=os.getenv("MCP_API_KEY"),
+        jwt_secret=os.getenv("JWT_SECRET"),
+        jwt_algorithm=os.getenv("JWT_ALGORITHM", "HS256"),
         log_level=os.getenv("LOG_LEVEL", "INFO"),
         enable_validation_logging=os.getenv("ENABLE_VALIDATION_LOGGING", "true").lower() == "true",
         max_sample_rows=int(os.getenv("MAX_SAMPLE_ROWS", "10")),
@@ -121,6 +142,13 @@ def load_config() -> QueryGenerationConfig:
     logger.info(f"  Max Iterations: {config.max_query_iterations}")
     logger.info(f"  Alignment Threshold: {config.alignment_threshold}")
     logger.info(f"  Transport: {config.mcp_transport}")
+    
+    # Log authentication status
+    if config.mcp_transport == "http":
+        if config.mcp_auth_enabled:
+            logger.info(f"  HTTP Authentication: Enabled (mode: {config.mcp_auth_mode})")
+        else:
+            logger.warning("  HTTP Authentication: DISABLED - Only use for development on localhost!")
     
     return config
 

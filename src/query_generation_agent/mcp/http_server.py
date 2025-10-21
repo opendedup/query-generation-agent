@@ -1,17 +1,20 @@
 """
 HTTP Server for Query Generation Agent
 
-Provides FastAPI-based HTTP server for containerized deployment.
+Provides FastAPI-based HTTP server for containerized deployment with SSE support.
 """
 
+import asyncio
+import json
 import logging
-from typing import Any, Dict
+from typing import Any, AsyncGenerator, Dict, Optional
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..clients.bigquery_client import BigQueryClient
 from ..clients.gemini_client import GeminiClient
+from .auth import AuthenticationMiddleware
 from .config import QueryGenerationConfig, load_config
 from .handlers import MCPHandlers
 from .tools import get_available_tools
@@ -26,6 +29,7 @@ logger = logging.getLogger(__name__)
 # Global instances
 config_instance: QueryGenerationConfig | None = None
 handlers_instance: MCPHandlers | None = None
+auth_middleware: AuthenticationMiddleware | None = None
 
 
 def create_http_app() -> FastAPI:
@@ -46,7 +50,7 @@ def create_http_app() -> FastAPI:
     @app.on_event("startup")
     async def startup_event() -> None:
         """Initialize server on startup."""
-        global config_instance, handlers_instance
+        global config_instance, handlers_instance, auth_middleware
         
         logger.info("Initializing Query Generation Agent HTTP Server...")
         
@@ -56,6 +60,10 @@ def create_http_app() -> FastAPI:
             
             # Set logging level
             logging.getLogger().setLevel(config_instance.log_level)
+            
+            # Initialize authentication middleware
+            logger.info("Initializing authentication middleware...")
+            auth_middleware = AuthenticationMiddleware(config_instance)
             
             # Initialize clients
             logger.info("Initializing BigQuery client...")
@@ -87,26 +95,63 @@ def create_http_app() -> FastAPI:
             logger.error(f"Failed to initialize server: {e}", exc_info=True)
             raise
     
-    @app.get("/")
-    async def root() -> Dict[str, Any]:
+    async def event_stream() -> AsyncGenerator[str, None]:
         """
-        Root endpoint with service information.
+        Generate Server-Sent Events stream.
+        
+        Yields formatted SSE messages for notifications and updates.
+        """
+        # Send initial connection message
+        yield f"event: message\ndata: {json.dumps({'type': 'connected', 'service': 'query-generation-agent'})}\n\n"
+        
+        # Keep connection alive with periodic heartbeat
+        try:
+            while True:
+                await asyncio.sleep(30)
+                yield f"event: heartbeat\ndata: {json.dumps({'timestamp': asyncio.get_event_loop().time()})}\n\n"
+        except asyncio.CancelledError:
+            logger.info("SSE stream closed")
+    
+    @app.get("/", response_model=None)
+    async def root(request: Request) -> Dict[str, Any] | StreamingResponse:
+        """
+        Root endpoint with service information or SSE endpoint.
+        
+        Args:
+            request: HTTP request
         
         Returns:
-            Service metadata
+            Service metadata (JSON) or SSE stream
         """
         if not config_instance:
             raise HTTPException(status_code=503, detail="Server not initialized")
         
+        # Check if client wants SSE stream
+        accept_header = request.headers.get("accept", "")
+        if "text/event-stream" in accept_header:
+            logger.info("Client requested SSE stream")
+            return StreamingResponse(
+                event_stream(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no"
+                }
+            )
+        
+        # Return service information
         return {
             "service": "Query Generation Agent",
             "version": config_instance.mcp_server_version,
             "status": "ready",
+            "transport": "http",
             "description": "MCP service for generating and validating BigQuery SQL queries",
             "endpoints": {
                 "health": "/health",
                 "tools": "/mcp/tools",
-                "call_tool": "/mcp/call-tool"
+                "call_tool": "/mcp/call-tool",
+                "sse": "/ (with Accept: text/event-stream)"
             },
             "documentation": "https://github.com/your-org/query-generation-agent"
         }
@@ -117,14 +162,36 @@ def create_http_app() -> FastAPI:
         Health check endpoint.
         
         Returns:
-            Health status
+            Health status with service name and transport mode
         """
         if not handlers_instance:
             raise HTTPException(status_code=503, detail="Server not fully initialized")
         
-        return {"status": "healthy"}
+        return {
+            "status": "healthy",
+            "service": "query-generation-agent",
+            "transport": "http"
+        }
     
-    @app.get("/mcp/tools")
+    async def verify_auth(
+        x_api_key: Optional[str] = Header(None),
+        authorization: Optional[str] = Header(None)
+    ) -> Optional[dict]:
+        """
+        Dependency for authentication verification.
+        
+        Args:
+            x_api_key: API key from X-API-Key header
+            authorization: Authorization header for JWT
+            
+        Returns:
+            Authentication payload or None
+        """
+        if not auth_middleware:
+            return None
+        return await auth_middleware.verify_request(x_api_key, authorization)
+    
+    @app.get("/mcp/tools", dependencies=[Depends(verify_auth)])
     async def list_tools() -> Dict[str, Any]:
         """
         List available MCP tools.
@@ -152,7 +219,7 @@ def create_http_app() -> FastAPI:
             logger.error(f"Error listing tools: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
     
-    @app.post("/mcp/call-tool")
+    @app.post("/mcp/call-tool", dependencies=[Depends(verify_auth)])
     async def call_tool(request: Request) -> Dict[str, Any]:
         """
         Execute an MCP tool.

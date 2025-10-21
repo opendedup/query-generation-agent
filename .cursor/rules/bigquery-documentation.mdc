@@ -1,0 +1,163 @@
+---
+description: BigQuery tables and fields must be self-describing with proper documentation
+globs: *.py
+---
+
+# BigQuery Table and Field Documentation Standards
+
+All BigQuery tables and fields created by code must be self-describing with comprehensive descriptions to ensure data discoverability and understanding.
+
+## Required Field Descriptions
+
+Every field in a BigQuery schema **must** include a `description` parameter:
+
+```python
+from google.cloud import bigquery
+
+# ✅ CORRECT - Every field has a description
+EXAMPLE_SCHEMA = [
+    bigquery.SchemaField("timestamp", "TIMESTAMP", description="The UTC timestamp when the prop odds were recorded."),
+    bigquery.SchemaField("commence_time", "TIMESTAMP", description="The UTC timestamp for the start of the game."),
+    bigquery.SchemaField("home_team", "STRING", description="The 3-letter abbreviation for the home team."),
+    bigquery.SchemaField("away_team", "STRING", description="The 3-letter abbreviation for the away team."),
+    bigquery.SchemaField("game_id", "STRING", description="A unique identifier for the game, combining teams, week, and year."),
+    bigquery.SchemaField("week", "INTEGER", description="The week of the game."),
+    bigquery.SchemaField("year", "INTEGER", description="The year of the game."),
+    bigquery.SchemaField("player_name", "STRING", description="The name of the player for the prop bet."),
+    bigquery.SchemaField("market", "STRING", description="The prop market type (e.g., 'player_pass_tds')."),
+    bigquery.SchemaField("line", "FLOAT", description="The line for the prop bet (e.g., 1.5 TDs)."),
+    bigquery.SchemaField("over_price", "INTEGER", description="The American odds for the over bet."),
+    bigquery.SchemaField("under_price", "INTEGER", description="The American odds for the under bet."),
+]
+
+# ❌ WRONG - Missing descriptions
+BAD_SCHEMA = [
+    bigquery.SchemaField("timestamp", "TIMESTAMP"),  # No description!
+    bigquery.SchemaField("home_team", "STRING"),     # No description!
+]
+```
+
+## Required Insert Timestamp Field
+
+**Every BigQuery table must include an `insert_timestamp` field** to track when records were inserted:
+
+```python
+bigquery.SchemaField('insert_timestamp', 'TIMESTAMP', description="The UTC timestamp when the record was inserted.")
+```
+
+This field should be:
+- Added to every table schema
+- Set automatically during insertion (typically using `CURRENT_TIMESTAMP()` or in application code)
+- Used for auditing and data lineage tracking
+
+## Required Dataset Descriptions
+
+When creating datasets, **always provide a dataset-level description**:
+
+```python
+from google.cloud import bigquery
+
+bq_client = bigquery.Client()
+
+# Create dataset with description
+dataset = bigquery.Dataset(dataset_ref)
+dataset.description = (
+    "Production analytics data containing player statistics, game results, "
+    "and betting odds. Updated daily after games complete. "
+    "Owned by: Analytics Team. Retention: 7 years."
+)
+dataset.location = "US"
+dataset = bq_client.create_dataset(dataset)
+print(f"Created dataset {dataset.project}.{dataset.dataset_id}")
+```
+
+Dataset descriptions should explain:
+- The overall purpose and scope of the dataset
+- What types of tables are contained within
+- The data domain or business area
+- Ownership and contact information
+- Data retention and lifecycle policies
+- Update frequency or schedule
+
+## Required Table Descriptions
+
+When creating tables, **always provide a table-level description**:
+
+```python
+bq_client = bigquery.Client()
+
+# Create table with description
+table = bigquery.Table(table_ref, schema=table_schema)
+if table_description:
+    table.description = table_description
+table = bq_client.create_table(table)
+print(f"Created table {table.project}.{table.dataset_id}.{table.table_id}")
+```
+
+Table descriptions should explain:
+- The purpose of the table
+- The type of data it contains
+- The source of the data
+- Update frequency or freshness expectations
+- Any important relationships to other tables
+
+## Complete Example
+
+```python
+from google.cloud import bigquery
+
+# Define schema with descriptions
+PLAYER_STATS_SCHEMA = [
+    bigquery.SchemaField("player_id", "STRING", description="Unique identifier for the player."),
+    bigquery.SchemaField("player_name", "STRING", description="Full name of the player."),
+    bigquery.SchemaField("team", "STRING", description="3-letter team abbreviation."),
+    bigquery.SchemaField("points", "INTEGER", description="Total points scored in the game."),
+    bigquery.SchemaField("assists", "INTEGER", description="Total assists in the game."),
+    bigquery.SchemaField("rebounds", "INTEGER", description="Total rebounds in the game."),
+    bigquery.SchemaField("game_date", "DATE", description="The date of the game."),
+    bigquery.SchemaField("insert_timestamp", "TIMESTAMP", description="The UTC timestamp when the record was inserted."),
+]
+
+# Create table with description
+def create_player_stats_table(project_id: str, dataset_id: str, table_id: str):
+    """Create the player stats table with proper documentation."""
+    bq_client = bigquery.Client()
+    table_ref = f"{project_id}.{dataset_id}.{table_id}"
+    
+    table = bigquery.Table(table_ref, schema=PLAYER_STATS_SCHEMA)
+    table.description = (
+        "Player statistics by game. Contains detailed performance metrics "
+        "for each player in each game. Data is updated daily after games conclude. "
+        "Source: Official league statistics API."
+    )
+    
+    table = bq_client.create_table(table)
+    print(f"Created table {table.project}.{table.dataset_id}.{table.table_id}")
+    return table
+```
+
+## Description Quality Guidelines
+
+### Field Descriptions Should:
+- Be clear and concise
+- Explain the meaning and purpose of the field
+- Include units of measurement if applicable (e.g., "in seconds", "in USD")
+- Mention format for codes/IDs (e.g., "3-letter abbreviation", "UUID format")
+- Provide examples for complex or ambiguous fields
+- Explain null values if they have special meaning
+
+### Table Descriptions Should:
+- Summarize the table's purpose in one sentence
+- Explain the data source
+- Describe update frequency
+- Note any important relationships or dependencies
+- Mention any data quality considerations
+
+## Benefits
+
+Self-describing tables and fields:
+- Enable better data discovery and understanding
+- Reduce need for external documentation
+- Support automated data cataloging and profiling
+- Help new team members understand the data model
+- Improve data governance and compliance

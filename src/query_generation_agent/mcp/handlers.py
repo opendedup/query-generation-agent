@@ -68,7 +68,7 @@ class MCPHandlers:
             syntax_validator=self.syntax_validator,
             dryrun_validator=self.dryrun_validator,
             alignment_validator=self.alignment_validator,
-            max_iterations=config.max_iterations
+            max_iterations=config.max_query_iterations
         )
         
         logger.info("MCP handlers initialized")

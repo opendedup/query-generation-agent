@@ -87,15 +87,16 @@ See `.env.example` for all available configuration options. Key variables:
 ### As MCP Server (stdio)
 
 ```bash
-# Start the MCP server in stdio mode
-poetry run python -m query_generation_agent.mcp.server
+# Start the MCP server in stdio mode (default)
+# Ensure MCP_TRANSPORT=stdio in .env or leave unset
+poetry run python -m query_generation_agent.mcp
 ```
 
 ### As HTTP Service
 
 ```bash
 # Set MCP_TRANSPORT=http in .env, then start the server
-poetry run python -m query_generation_agent.mcp.http_server
+poetry run python -m query_generation_agent.mcp
 
 # Or with uvicorn directly
 poetry run uvicorn query_generation_agent.mcp.http_server:app --host 0.0.0.0 --port 8081

@@ -1,0 +1,110 @@
+---
+alwaysApply: true
+---
+
+# Poetry Dependency Management
+
+This project uses [Poetry](https://python-poetry.org/) for Python dependency management and packaging.
+
+## Project Configuration
+
+All dependencies and project metadata are defined in [pyproject.toml](mdc:pyproject.toml).
+
+### Python Version
+- **Supported Python versions**: `>=3.10,<3.13`
+
+### Key Dependencies
+- Google Cloud services (BigQuery, Storage, Discovery Engine, Data Catalog, Dataplex, DLP, Lineage)
+- Data processing: pandas, numpy
+- Configuration: python-dotenv, pydantic
+- AI/ML: google-generativeai
+- API: FastAPI, uvicorn, httpx
+- MCP: mcp
+
+### Development Dependencies
+- Testing: pytest, pytest-asyncio, pytest-mock, pytest-cov, freezegun, responses
+- Code quality: black, ruff
+
+## Common Poetry Commands
+
+### Installation
+```bash
+# Install all dependencies (including dev dependencies)
+poetry install
+
+# Install only production dependencies
+poetry install --no-dev
+```
+
+### Adding Dependencies
+```bash
+# Add a production dependency
+poetry add package-name
+
+# Add a development dependency
+poetry add --group dev package-name
+
+# Add with version constraint
+poetry add "package-name>=1.0.0,<2.0.0"
+```
+
+### Removing Dependencies
+```bash
+# Remove a dependency
+poetry remove package-name
+
+# Remove a dev dependency
+poetry remove --group dev package-name
+```
+
+### Running Commands
+```bash
+# Run a command in the Poetry virtual environment
+poetry run python script.py
+poetry run pytest
+
+# Activate the Poetry shell
+poetry shell
+```
+
+### Updating Dependencies
+```bash
+# Update all dependencies to latest compatible versions
+poetry update
+
+# Update a specific package
+poetry update package-name
+
+# Show outdated packages
+poetry show --outdated
+```
+
+### Exporting Dependencies
+```bash
+# Export to requirements.txt format (if needed for compatibility)
+poetry export -f requirements.txt --output requirements.txt --without-hashes
+```
+
+## When Adding New Dependencies
+
+1. **Use `poetry add`** instead of manually editing `pyproject.toml`
+2. **Specify appropriate version constraints** to ensure compatibility
+3. **Add dev dependencies to the dev group**: `poetry add --group dev package-name`
+4. **Run tests** after adding dependencies to ensure compatibility
+5. **Commit both `pyproject.toml` and `poetry.lock`** to version control
+
+## Virtual Environment
+
+Poetry automatically creates and manages a virtual environment for the project:
+- Location varies by system (use `poetry env info` to see details)
+- Activate with `poetry shell` or prefix commands with `poetry run`
+
+## Best Practices
+
+- ✅ Always use `poetry add` and `poetry remove` for dependency changes
+- ✅ Commit `poetry.lock` to ensure reproducible builds
+- ✅ Use version constraints that allow patch updates: `^1.2.3` (allows >=1.2.3, <2.0.0)
+- ✅ Keep dependencies up to date with `poetry update` regularly
+- ❌ Don't manually edit `poetry.lock`
+- ❌ Don't use `pip install` directly (use `poetry add` instead)
+- ❌ Don't commit virtual environment directories

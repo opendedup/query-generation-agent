@@ -1,0 +1,56 @@
+---
+description: Uses environment variables for managing configurations.
+globs: *
+---
+
+# Configuration Management Using Environment Variables
+
+This project uses environment variables for all configuration management to ensure flexibility, security, and environment-specific customization.
+
+## Configuration Approach
+
+### Loading Environment Variables
+
+All applications and scripts should load configuration from environment variables using `python-dotenv`:
+
+```python
+from dotenv import load_dotenv
+import os
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Access configuration values
+config_value = os.getenv('CONFIG_KEY')
+```
+
+### Configuration File Structure
+
+- **`.env`** - Contains actual configuration values (NEVER committed to git)
+- **`.env.example`** - Template showing required variables (committed to git)
+- Environment variables can also be set at the system/container level
+
+### Best Practices
+
+1. **Always use `os.getenv()`** to access configuration values
+2. **Never hardcode** environment-specific values in code
+3. **Provide validation** for required configuration:
+   ```python
+   if not os.getenv('REQUIRED_CONFIG'):
+       raise ValueError("REQUIRED_CONFIG environment variable must be set")
+   ```
+4. **Use meaningful names** for environment variables (e.g., `GCP_PROJECT_ID`, not `PROJECT`)
+5. **Document new variables** in `.env.example` with comments
+6. **Use sensible defaults** only for non-sensitive, non-environment-specific values:
+   ```python
+   log_level = os.getenv('LOG_LEVEL', 'INFO')  # OK - non-sensitive
+   ```
+
+### Common Configuration Categories
+
+- **Cloud Resources**: Project IDs, bucket names, datastore IDs
+- **API Keys**: Authentication keys and tokens
+- **Service Configuration**: Locations, regions, endpoints
+- **Application Settings**: Logging levels, feature flags, timeouts
+
+See [.env.example](mdc:.env.example) for the complete list of configuration variables used in this project.

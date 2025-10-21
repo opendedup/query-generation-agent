@@ -40,18 +40,20 @@ The server is now listening on stdio for MCP protocol messages.
 
 ### 1-2. Same as above
 
-### 3. Set HTTP mode
+### 3. Set HTTP mode (Development - No Auth)
 
 Edit `.env`:
 ```bash
 MCP_TRANSPORT=http
+MCP_HOST=127.0.0.1  # localhost only for security
 MCP_PORT=8081
+MCP_AUTH_ENABLED=false  # Disable auth for development
 ```
 
 ### 4. Run HTTP Server
 
 ```bash
-poetry run python -m query_generation_agent.mcp.http_server
+poetry run python -m query_generation_agent.mcp
 ```
 
 ### 5. Test with curl
@@ -67,6 +69,58 @@ curl http://localhost:8081/mcp/tools
 curl -X POST http://localhost:8081/mcp/call-tool \
   -H "Content-Type: application/json" \
   -d @examples/sample_request.json
+```
+
+## Option 2b: HTTP Server with Authentication
+
+### For Production/Shared Environments
+
+**API Key Authentication:**
+```bash
+MCP_TRANSPORT=http
+MCP_HOST=0.0.0.0
+MCP_PORT=8081
+MCP_AUTH_ENABLED=true
+MCP_AUTH_MODE=api_key
+MCP_API_KEY=your-secret-api-key-here
+```
+
+**JWT Authentication** (requires PyJWT):
+```bash
+# Install JWT support
+poetry install --extras jwt
+
+# Configure
+MCP_TRANSPORT=http
+MCP_HOST=0.0.0.0
+MCP_PORT=8081
+MCP_AUTH_ENABLED=true
+MCP_AUTH_MODE=jwt
+JWT_SECRET=your-jwt-secret
+JWT_ALGORITHM=HS256
+```
+
+**Gateway Authentication** (trust upstream):
+```bash
+MCP_TRANSPORT=http
+MCP_HOST=0.0.0.0
+MCP_PORT=8081
+MCP_AUTH_ENABLED=true
+MCP_AUTH_MODE=gateway
+```
+
+### Testing with Authentication
+
+**API Key:**
+```bash
+curl -H "X-API-Key: your-secret-api-key-here" \
+  http://localhost:8081/mcp/tools
+```
+
+**JWT:**
+```bash
+curl -H "Authorization: Bearer your-jwt-token" \
+  http://localhost:8081/mcp/tools
 ```
 
 ## Option 3: Docker Deployment

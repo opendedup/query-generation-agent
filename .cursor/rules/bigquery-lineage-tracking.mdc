@@ -1,0 +1,971 @@
+---
+description: BigQuery and GCS writes must record lineage using Data Catalog Lineage v1
+globs: **/writers/*.py,**/collectors/*.py,**/orchestration/*.py,**/dags/*.py,**/exporters/*.py,**/loaders/*.py
+---
+
+# Data Lineage Tracking Requirements
+
+All data writes (BigQuery tables and GCS files) **must record lineage** using the Data Catalog Lineage v1 API to maintain data provenance and enable lineage visualization.
+
+## Scope
+
+This applies to:
+- **BigQuery writes**: INSERT, MERGE, CREATE TABLE AS, LOAD
+- **GCS writes**: Upload files, write objects, stream writes
+- **External source ingestion**: APIs, databases, SaaS platforms, webhooks
+- **Transformations**: Data processing pipelines, format conversions
+
+## Required Library
+
+```python
+from google.cloud import datacatalog_lineage_v1
+```
+
+Ensure `google-cloud-datacatalog-lineage` is in dependencies.
+
+## Core Lineage Recording Pattern
+
+Every BigQuery write operation should follow this pattern:
+
+1. **Start tracking** - Record start_time before operation
+2. **Execute operation** - Perform BigQuery write
+3. **Record lineage** - Create Process → Run → LineageEvent
+4. **Handle errors** - Set run state to FAILED on exceptions
+
+### Example: Recording Lineage for BigQuery Write
+
+```python
+from datetime import datetime, timezone
+from google.cloud import datacatalog_lineage_v1
+
+def write_to_bigquery_with_lineage(
+    project_id: str,
+    location: str,
+    source_fqn: str,  # e.g., "gs://bucket/data.json" or API endpoint
+    target_table: str,  # e.g., "project.dataset.table"
+    process_name: str,  # e.g., DAG name or script name
+    task_id: str,  # e.g., task identifier
+) -> None:
+    """Write data to BigQuery and record lineage."""
+    
+    start_time = datetime.now(timezone.utc)
+    is_success = False
+    
+    try:
+        # 1. Perform BigQuery operation
+        # ... your BigQuery write logic here ...
+        
+        is_success = True
+        
+    finally:
+        end_time = datetime.now(timezone.utc)
+        
+        # 2. Record lineage regardless of success/failure
+        record_lineage(
+            project_id=project_id,
+            location=location,
+            process_name=process_name,
+            task_id=task_id,
+            source_fqn=source_fqn,
+            target_fqn=f"bigquery:{target_table}",
+            start_time=start_time,
+            end_time=end_time,
+            is_success=is_success
+        )
+```
+
+## Fully Qualified Name (FQN) Formats
+
+Lineage requires properly formatted FQNs:
+
+| Asset Type | FQN Format | Example |
+|------------|------------|---------|
+| BigQuery Table | `bigquery:project.dataset.table` | `bigquery:myproject.analytics.user_events` |
+| GCS File | `gs://bucket/path/to/file` | `gs://my-bucket/data/2024/file.json` |
+| GCS Prefix/Folder | `gs://bucket/path/prefix/` | `gs://my-bucket/raw-data/2024/` |
+| REST API | `https://domain/path` | `https://api.github.com/v1/repos` |
+| JDBC Database | `jdbc:database://host:port/db` | `jdbc:postgresql://db.example.com:5432/prod` |
+| Cloud SQL | `cloudsql:project:region:instance/database` | `cloudsql:myproject:us-central1:prod/analytics` |
+| Pub/Sub Topic | `pubsub:project/topics/topic-name` | `pubsub:myproject/topics/events-stream` |
+| Kafka Topic | `kafka://cluster/topic` | `kafka://prod-cluster/user-events` |
+| SFTP Server | `sftp://host/path` | `sftp://partner.example.com/exports/` |
+| SaaS Platform | Custom URI with scheme | `salesforce://myorg/Account`, `stripe://api/charges` |
+
+**Important:** 
+- Always use `bigquery:` prefix for BigQuery tables, not `bigquery://`
+- Use descriptive URIs for external sources that include system name and resource identifier
+- Include version or endpoint details in API URIs when relevant
+
+## Core Lineage Functions
+
+Use these helper functions (create in `src/data_discovery_agent/utils/lineage.py`):
+
+### 1. Get or Create Process
+
+```python
+def get_or_create_process(
+    project_id: str, 
+    location: str, 
+    process_display_name: str
+) -> str:
+    """
+    Creates a lineage process representing a pipeline or script.
+    
+    Args:
+        project_id: GCP project ID
+        location: GCP location (e.g., 'us-central1')
+        process_display_name: Human-readable name (e.g., DAG name)
+    
+    Returns:
+        Process resource name
+    """
+    client = datacatalog_lineage_v1.LineageClient()
+    parent = f"projects/{project_id}/locations/{location}"
+    
+    process = datacatalog_lineage_v1.Process(
+        display_name=process_display_name,
+        attributes={
+            "framework": "data_discovery_agent",
+            "owner": "data-engineering-team"
+        }
+    )
+    
+    request = datacatalog_lineage_v1.CreateProcessRequest(
+        parent=parent,
+        process=process,
+    )
+    
+    response = client.create_process(request=request)
+    logger.info(f"Created lineage process: {response.name}")
+    return response.name
+```
+
+### 2. Create Run
+
+```python
+def create_run(
+    process_resource_name: str,
+    start_time: datetime,
+    end_time: datetime,
+    state: datacatalog_lineage_v1.Run.State,
+    run_display_name: str
+) -> str:
+    """
+    Creates a lineage run representing a task execution.
+    
+    Args:
+        process_resource_name: Parent process resource name
+        start_time: UTC datetime when task started
+        end_time: UTC datetime when task ended
+        state: Run.State.COMPLETED or Run.State.FAILED
+        run_display_name: Human-readable run name (e.g., task_id)
+    
+    Returns:
+        Run resource name
+    """
+    client = datacatalog_lineage_v1.LineageClient()
+    
+    run = datacatalog_lineage_v1.Run(
+        start_time=start_time.astimezone(timezone.utc),
+        end_time=end_time.astimezone(timezone.utc),
+        state=state,
+        display_name=run_display_name
+    )
+    
+    request = datacatalog_lineage_v1.CreateRunRequest(
+        parent=process_resource_name,
+        run=run
+    )
+    
+    response = client.create_run(request=request)
+    logger.info(f"Created lineage run: {response.name}")
+    return response.name
+```
+
+### 3. Create Lineage Event
+
+```python
+def create_lineage_event(
+    run_resource_name: str,
+    source_fqn: str,
+    target_fqn: str,
+    start_time: datetime,
+    end_time: datetime
+) -> None:
+    """
+    Creates a lineage event linking source to target.
+    
+    Args:
+        run_resource_name: Parent run resource name
+        source_fqn: Source asset FQN (e.g., GCS, API)
+        target_fqn: Target asset FQN (e.g., BigQuery table)
+        start_time: UTC datetime
+        end_time: UTC datetime
+    """
+    client = datacatalog_lineage_v1.LineageClient()
+    
+    source = datacatalog_lineage_v1.EntityReference(
+        fully_qualified_name=source_fqn
+    )
+    target = datacatalog_lineage_v1.EntityReference(
+        fully_qualified_name=target_fqn
+    )
+    
+    links = [datacatalog_lineage_v1.EventLink(source=source, target=target)]
+    
+    lineage_event = datacatalog_lineage_v1.LineageEvent(
+        links=links,
+        start_time=start_time.astimezone(timezone.utc),
+        end_time=end_time.astimezone(timezone.utc)
+    )
+    
+    request = datacatalog_lineage_v1.CreateLineageEventRequest(
+        parent=run_resource_name,
+        lineage_event=lineage_event
+    )
+    
+    client.create_lineage_event(request=request)
+    logger.info("Lineage event created")
+```
+
+## Common Lineage Scenarios
+
+### Scenario 1: GCS → BigQuery (Data Load)
+
+```python
+def record_gcs_to_bq_lineage(
+    project_id: str,
+    location: str,
+    dag_name: str,
+    task_id: str,
+    gcs_uri: str,  # e.g., "gs://my-bucket/data/file.json"
+    bq_table_fqn: str,  # e.g., "bigquery:project.dataset.table"
+    start_time: datetime,
+    end_time: datetime,
+    is_success: bool
+) -> None:
+    """Record lineage for GCS to BigQuery load operation."""
+    
+    # 1. Create process
+    process_name = get_or_create_process(project_id, location, dag_name)
+    
+    # 2. Create run
+    state = (datacatalog_lineage_v1.Run.State.COMPLETED 
+             if is_success 
+             else datacatalog_lineage_v1.Run.State.FAILED)
+    
+    run_name = create_run(
+        process_resource_name=process_name,
+        start_time=start_time,
+        end_time=end_time,
+        state=state,
+        run_display_name=task_id
+    )
+    
+    # 3. Create lineage event
+    create_lineage_event(
+        run_resource_name=run_name,
+        source_fqn=gcs_uri,
+        target_fqn=bq_table_fqn,
+        start_time=start_time,
+        end_time=end_time
+    )
+```
+
+### Scenario 2: BigQuery → BigQuery (Transformation)
+
+```python
+def record_bq_to_bq_lineage(
+    project_id: str,
+    location: str,
+    dag_name: str,
+    task_id: str,
+    source_table: str,  # "project.dataset.source_table"
+    target_table: str,  # "project.dataset.target_table"
+    start_time: datetime,
+    end_time: datetime,
+    is_success: bool
+) -> None:
+    """Record lineage for BigQuery to BigQuery transformation."""
+    
+    process_name = get_or_create_process(project_id, location, dag_name)
+    
+    state = (datacatalog_lineage_v1.Run.State.COMPLETED 
+             if is_success 
+             else datacatalog_lineage_v1.Run.State.FAILED)
+    
+    run_name = create_run(
+        process_resource_name=process_name,
+        start_time=start_time,
+        end_time=end_time,
+        state=state,
+        run_display_name=task_id
+    )
+    
+    create_lineage_event(
+        run_resource_name=run_name,
+        source_fqn=f"bigquery:{source_table}",
+        target_fqn=f"bigquery:{target_table}",
+        start_time=start_time,
+        end_time=end_time
+    )
+```
+
+### Scenario 3: API → GCS (External Source to GCS)
+
+```python
+def record_api_to_gcs_lineage(
+    project_id: str,
+    location: str,
+    dag_name: str,
+    task_id: str,
+    api_uri: str,  # e.g., "https://api.github.com/v1/repos"
+    gcs_uri: str,  # e.g., "gs://my-bucket/raw/repos.json"
+    start_time: datetime,
+    end_time: datetime,
+    is_success: bool,
+    source_metadata: dict = None  # Optional: API version, auth type, etc.
+) -> None:
+    """Record lineage for API to GCS ingestion."""
+    
+    process_name = get_or_create_process(project_id, location, dag_name)
+    
+    state = (datacatalog_lineage_v1.Run.State.COMPLETED 
+             if is_success 
+             else datacatalog_lineage_v1.Run.State.FAILED)
+    
+    run_name = create_run(
+        process_resource_name=process_name,
+        start_time=start_time,
+        end_time=end_time,
+        state=state,
+        run_display_name=task_id
+    )
+    
+    create_lineage_event(
+        run_resource_name=run_name,
+        source_fqn=api_uri,
+        target_fqn=gcs_uri,
+        start_time=start_time,
+        end_time=end_time
+    )
+```
+
+### Scenario 4: API → GCS → BigQuery (Multi-stage Pipeline)
+
+Record lineage for each stage to maintain complete provenance:
+
+```python
+# Stage 1: API → GCS (Raw data ingestion)
+record_api_to_gcs_lineage(
+    project_id=project_id,
+    location=location,
+    dag_name="user_ingestion_pipeline",
+    task_id="fetch_from_api",
+    api_uri="https://api.example.com/v1/users",
+    gcs_uri="gs://my-bucket/raw/users/2024-10-20.json",
+    start_time=start_time_1,
+    end_time=end_time_1,
+    is_success=True
+)
+
+# Stage 2: GCS → BigQuery (Load to warehouse)
+record_gcs_to_bq_lineage(
+    project_id=project_id,
+    location=location,
+    dag_name="user_ingestion_pipeline",
+    task_id="load_to_bigquery",
+    gcs_uri="gs://my-bucket/raw/users/2024-10-20.json",
+    bq_table_fqn="bigquery:project.dataset.users",
+    start_time=start_time_2,
+    end_time=end_time_2,
+    is_success=True
+)
+```
+
+### Scenario 5: GCS → GCS (Transformation/Processing)
+
+```python
+def record_gcs_to_gcs_lineage(
+    project_id: str,
+    location: str,
+    dag_name: str,
+    task_id: str,
+    source_gcs_uri: str,  # Raw data location
+    target_gcs_uri: str,  # Processed data location
+    start_time: datetime,
+    end_time: datetime,
+    is_success: bool,
+    transformation_type: str = None  # e.g., "format_conversion", "deduplication"
+) -> None:
+    """Record lineage for GCS to GCS transformation."""
+    
+    process_name = get_or_create_process(project_id, location, dag_name)
+    
+    state = (datacatalog_lineage_v1.Run.State.COMPLETED 
+             if is_success 
+             else datacatalog_lineage_v1.Run.State.FAILED)
+    
+    run_name = create_run(
+        process_resource_name=process_name,
+        start_time=start_time,
+        end_time=end_time,
+        state=state,
+        run_display_name=task_id
+    )
+    
+    create_lineage_event(
+        run_resource_name=run_name,
+        source_fqn=source_gcs_uri,
+        target_fqn=target_gcs_uri,
+        start_time=start_time,
+        end_time=end_time
+    )
+```
+
+## External Source Tracking
+
+When ingesting data from external sources, it's critical to document the source system, extraction method, and any relevant metadata.
+
+### Tracking External Sources: Best Practices
+
+1. **Use descriptive FQNs** that identify the source system
+2. **Include version or timestamp** in API URIs when available
+3. **Document extraction parameters** in process attributes
+4. **Track source system metadata** (credentials used, pagination, filters)
+5. **Record data freshness indicators** (last_modified, extraction_timestamp)
+
+### Enhanced Process Creation with Source Metadata
+
+```python
+def get_or_create_process_with_metadata(
+    project_id: str,
+    location: str,
+    process_display_name: str,
+    source_system: str,  # e.g., "salesforce", "github", "stripe"
+    source_type: str,  # e.g., "rest_api", "jdbc", "sftp"
+    extraction_method: str = None,  # e.g., "full", "incremental", "delta"
+    owner: str = "data-engineering-team"
+) -> str:
+    """
+    Creates a lineage process with enhanced metadata about the source.
+    
+    Args:
+        project_id: GCP project ID
+        location: GCP location
+        process_display_name: Human-readable process name
+        source_system: Name of the source system
+        source_type: Type of source (api, database, file_transfer, etc.)
+        extraction_method: How data is extracted
+        owner: Team or person responsible
+    
+    Returns:
+        Process resource name
+    """
+    client = datacatalog_lineage_v1.LineageClient()
+    parent = f"projects/{project_id}/locations/{location}"
+    
+    process = datacatalog_lineage_v1.Process(
+        display_name=process_display_name,
+        attributes={
+            "framework": "data_discovery_agent",
+            "owner": owner,
+            "source_system": source_system,
+            "source_type": source_type,
+            "extraction_method": extraction_method or "full",
+        }
+    )
+    
+    request = datacatalog_lineage_v1.CreateProcessRequest(
+        parent=parent,
+        process=process,
+    )
+    
+    response = client.create_process(request=request)
+    logger.info(f"Created lineage process with metadata: {response.name}")
+    return response.name
+```
+
+### Example: Tracking Various External Sources
+
+#### REST API with Metadata
+
+```python
+def ingest_from_rest_api(**context):
+    """Example: Ingest data from REST API to GCS."""
+    start_time = datetime.now(timezone.utc)
+    is_success = False
+    
+    api_endpoint = "https://api.stripe.com/v1/charges"
+    gcs_output = f"gs://my-bucket/raw/stripe/charges_{datetime.now().strftime('%Y%m%d')}.json"
+    
+    try:
+        # Fetch data from API
+        response = requests.get(api_endpoint, headers={"Authorization": f"Bearer {api_key}"})
+        data = response.json()
+        
+        # Write to GCS
+        storage_client = storage.Client()
+        bucket = storage_client.bucket("my-bucket")
+        blob = bucket.blob(f"raw/stripe/charges_{datetime.now().strftime('%Y%m%d')}.json")
+        blob.upload_from_string(json.dumps(data), content_type="application/json")
+        
+        is_success = True
+        
+    finally:
+        end_time = datetime.now(timezone.utc)
+        
+        # Record lineage with source metadata
+        process_name = get_or_create_process_with_metadata(
+            project_id=os.getenv('GCP_PROJECT_ID'),
+            location='us-central1',
+            process_display_name=context['dag'].dag_id,
+            source_system="stripe",
+            source_type="rest_api",
+            extraction_method="full"
+        )
+        
+        state = (datacatalog_lineage_v1.Run.State.COMPLETED 
+                 if is_success 
+                 else datacatalog_lineage_v1.Run.State.FAILED)
+        
+        run_name = create_run(
+            process_resource_name=process_name,
+            start_time=start_time,
+            end_time=end_time,
+            state=state,
+            run_display_name=context['task'].task_id
+        )
+        
+        create_lineage_event(
+            run_resource_name=run_name,
+            source_fqn=api_endpoint,
+            target_fqn=gcs_output,
+            start_time=start_time,
+            end_time=end_time
+        )
+```
+
+#### JDBC Database Extraction
+
+```python
+def ingest_from_postgres(**context):
+    """Example: Extract data from PostgreSQL to GCS."""
+    start_time = datetime.now(timezone.utc)
+    is_success = False
+    
+    db_fqn = "jdbc:postgresql://prod-db.example.com:5432/analytics"
+    table_fqn = f"{db_fqn}/public.user_events"
+    gcs_output = f"gs://my-bucket/raw/postgres/user_events_{datetime.now().strftime('%Y%m%d')}.parquet"
+    
+    try:
+        # Extract from database
+        conn = psycopg2.connect(...)
+        df = pd.read_sql("SELECT * FROM public.user_events WHERE date = CURRENT_DATE", conn)
+        
+        # Write to GCS
+        df.to_parquet(gcs_output)
+        
+        is_success = True
+        
+    finally:
+        end_time = datetime.now(timezone.utc)
+        
+        # Record lineage
+        record_external_to_gcs_lineage(
+            project_id=os.getenv('GCP_PROJECT_ID'),
+            location='us-central1',
+            dag_name=context['dag'].dag_id,
+            task_id=context['task'].task_id,
+            source_fqn=table_fqn,  # Full table FQN
+            target_fqn=gcs_output,
+            start_time=start_time,
+            end_time=end_time,
+            is_success=is_success,
+            source_system="postgres_prod",
+            source_type="jdbc",
+            extraction_method="incremental"
+        )
+```
+
+#### SaaS Platform (Salesforce, HubSpot, etc.)
+
+```python
+def ingest_from_salesforce(**context):
+    """Example: Extract Salesforce data to GCS."""
+    start_time = datetime.now(timezone.utc)
+    is_success = False
+    
+    # Use custom URI scheme for SaaS platforms
+    sf_object_uri = "salesforce://myorg.salesforce.com/Account"
+    gcs_output = f"gs://my-bucket/raw/salesforce/accounts_{datetime.now().strftime('%Y%m%d')}.json"
+    
+    try:
+        # Extract from Salesforce
+        sf = Salesforce(username=..., password=..., security_token=...)
+        accounts = sf.query_all("SELECT Id, Name, Industry FROM Account")
+        
+        # Write to GCS
+        storage_client = storage.Client()
+        bucket = storage_client.bucket("my-bucket")
+        blob = bucket.blob(f"raw/salesforce/accounts_{datetime.now().strftime('%Y%m%d')}.json")
+        blob.upload_from_string(json.dumps(accounts), content_type="application/json")
+        
+        is_success = True
+        
+    finally:
+        end_time = datetime.now(timezone.utc)
+        
+        # Record lineage
+        record_external_to_gcs_lineage(
+            project_id=os.getenv('GCP_PROJECT_ID'),
+            location='us-central1',
+            dag_name=context['dag'].dag_id,
+            task_id=context['task'].task_id,
+            source_fqn=sf_object_uri,
+            target_fqn=gcs_output,
+            start_time=start_time,
+            end_time=end_time,
+            is_success=is_success,
+            source_system="salesforce",
+            source_type="saas_api",
+            extraction_method="full"
+        )
+```
+
+#### Pub/Sub Streaming
+
+```python
+def process_pubsub_to_gcs(**context):
+    """Example: Process Pub/Sub messages and write to GCS."""
+    start_time = datetime.now(timezone.utc)
+    is_success = False
+    
+    pubsub_topic = "pubsub:myproject/topics/user-events"
+    gcs_output = f"gs://my-bucket/streaming/events_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    
+    try:
+        # Process messages and write to GCS
+        # ... streaming logic ...
+        
+        is_success = True
+        
+    finally:
+        end_time = datetime.now(timezone.utc)
+        
+        # Record lineage
+        record_external_to_gcs_lineage(
+            project_id=os.getenv('GCP_PROJECT_ID'),
+            location='us-central1',
+            dag_name=context['dag'].dag_id,
+            task_id=context['task'].task_id,
+            source_fqn=pubsub_topic,
+            target_fqn=gcs_output,
+            start_time=start_time,
+            end_time=end_time,
+            is_success=is_success,
+            source_system="pubsub",
+            source_type="streaming",
+            extraction_method="real_time"
+        )
+```
+
+### Generic External to GCS Helper Function
+
+```python
+def record_external_to_gcs_lineage(
+    project_id: str,
+    location: str,
+    dag_name: str,
+    task_id: str,
+    source_fqn: str,
+    target_fqn: str,
+    start_time: datetime,
+    end_time: datetime,
+    is_success: bool,
+    source_system: str,
+    source_type: str,
+    extraction_method: str = "full"
+) -> None:
+    """
+    Record lineage for external source to GCS with comprehensive metadata.
+    
+    Args:
+        project_id: GCP project ID
+        location: GCP location
+        dag_name: DAG or pipeline name
+        task_id: Task identifier
+        source_fqn: Source system FQN
+        target_fqn: GCS target path
+        start_time: Start time
+        end_time: End time
+        is_success: Whether operation succeeded
+        source_system: Name of source system (e.g., "stripe", "salesforce")
+        source_type: Type of source (e.g., "rest_api", "jdbc", "saas_api")
+        extraction_method: How data was extracted (e.g., "full", "incremental")
+    """
+    # Create process with metadata
+    process_name = get_or_create_process_with_metadata(
+        project_id=project_id,
+        location=location,
+        process_display_name=dag_name,
+        source_system=source_system,
+        source_type=source_type,
+        extraction_method=extraction_method
+    )
+    
+    # Create run
+    state = (datacatalog_lineage_v1.Run.State.COMPLETED 
+             if is_success 
+             else datacatalog_lineage_v1.Run.State.FAILED)
+    
+    run_name = create_run(
+        process_resource_name=process_name,
+        start_time=start_time,
+        end_time=end_time,
+        state=state,
+        run_display_name=task_id
+    )
+    
+    # Create lineage event
+    create_lineage_event(
+        run_resource_name=run_name,
+        source_fqn=source_fqn,
+        target_fqn=target_fqn,
+        start_time=start_time,
+        end_time=end_time
+    )
+    
+    logger.info(f"Recorded lineage from {source_system} ({source_type}) to GCS")
+```
+
+## Integration with Airflow DAGs
+
+In Airflow tasks, wrap data write operations with lineage recording:
+
+```python
+from airflow.operators.python import PythonOperator
+
+def my_bigquery_task(**context):
+    """Airflow task that writes to BigQuery."""
+    from datetime import datetime, timezone
+    
+    start_time = datetime.now(timezone.utc)
+    is_success = False
+    
+    try:
+        # Your BigQuery write logic
+        bq_client.load_table_from_uri(
+            source_uris=["gs://bucket/data.json"],
+            destination="project.dataset.table"
+        )
+        is_success = True
+        
+    finally:
+        end_time = datetime.now(timezone.utc)
+        
+        # Record lineage
+        record_gcs_to_bq_lineage(
+            project_id=os.getenv('GCP_PROJECT_ID'),
+            location=os.getenv('GCP_REGION', 'us-central1'),
+            dag_name=context['dag'].dag_id,
+            task_id=context['task'].task_id,
+            gcs_uri="gs://bucket/data.json",
+            bq_table_fqn="bigquery:project.dataset.table",
+            start_time=start_time,
+            end_time=end_time,
+            is_success=is_success
+        )
+
+task = PythonOperator(
+    task_id='load_data',
+    python_callable=my_bigquery_task,
+    dag=dag
+)
+```
+
+## Querying Lineage
+
+To retrieve lineage information for a BigQuery table:
+
+```python
+def get_table_lineage(project_id: str, location: str, table_fqn: str) -> dict:
+    """
+    Retrieves upstream and downstream lineage for a BigQuery table.
+    
+    Args:
+        project_id: GCP project ID
+        location: GCP location (e.g., 'us-central1')
+        table_fqn: BigQuery table FQN (e.g., "bigquery:project.dataset.table")
+    
+    Returns:
+        dict with 'upstream', 'downstream', and 'processes' keys
+    """
+    client = datacatalog_lineage_v1.LineageClient()
+    parent = f"projects/{project_id}/locations/{location}"
+    
+    target_entity = datacatalog_lineage_v1.EntityReference(
+        fully_qualified_name=table_fqn
+    )
+    
+    upstream_assets = []
+    downstream_assets = []
+    
+    # Find upstream sources (data flowing INTO this table)
+    request = datacatalog_lineage_v1.SearchLinksRequest(
+        parent=parent,
+        target=target_entity,
+    )
+    
+    for link in client.search_links(request=request):
+        if link.source and link.source.fully_qualified_name:
+            upstream_assets.append(link.source.fully_qualified_name)
+    
+    # Find downstream targets (data flowing FROM this table)
+    source_entity = datacatalog_lineage_v1.EntityReference(
+        fully_qualified_name=table_fqn
+    )
+    
+    request = datacatalog_lineage_v1.SearchLinksRequest(
+        parent=parent,
+        source=source_entity,
+    )
+    
+    for link in client.search_links(request=request):
+        if link.target and link.target.fully_qualified_name:
+            downstream_assets.append(link.target.fully_qualified_name)
+    
+    return {
+        'table': table_fqn,
+        'upstream': upstream_assets,
+        'downstream': downstream_assets,
+    }
+```
+
+## Best Practices
+
+### General Practices
+
+1. **Always record lineage in finally block** - Ensures lineage is captured even on failure
+2. **Use UTC timestamps** - Convert all datetimes to UTC before passing to API
+3. **Set appropriate state** - Use `COMPLETED` for success, `FAILED` for errors
+4. **Include process metadata** - Add `attributes` like framework, owner, version, source_system
+5. **Use descriptive names** - Process and run display names should be human-readable
+6. **Handle idempotency** - Process creation is not idempotent; handle gracefully
+7. **Log lineage operations** - Always log when lineage is recorded for debugging
+8. **Validate FQNs** - Ensure BigQuery FQNs use `bigquery:` prefix, not `bigquery://`
+
+### GCS Write Practices
+
+1. **Include timestamps in file paths** - Makes lineage tracking more granular and auditable
+2. **Use consistent path structures** - Organize by source, date, and entity type
+3. **Document file formats** - Include format in process attributes (json, parquet, csv, avro)
+4. **Track intermediate writes** - Don't skip GCS staging steps in multi-stage pipelines
+5. **Use full GCS URIs** - Always include `gs://` prefix and full path
+
+### External Source Practices
+
+1. **Use descriptive FQN schemes** - Custom URIs should identify source system clearly
+2. **Document source metadata** - Include API version, extraction params in process attributes
+3. **Track extraction method** - Specify full, incremental, delta, or real-time
+4. **Include source credentials info** - Document which service account or auth method used
+5. **Record data freshness** - Include last_modified or extraction timestamp when available
+6. **Handle API pagination** - Document if data is complete or partial
+7. **Track rate limits** - Log if extraction was throttled or limited
+8. **Version external APIs** - Include API version in FQN when applicable
+
+### Multi-Stage Pipeline Practices
+
+1. **Record each stage separately** - Don't skip intermediate steps
+2. **Maintain FQN consistency** - Use same GCS URIs across stages
+3. **Document transformations** - Describe what changed between stages
+4. **Link related runs** - Use consistent process names across pipeline stages
+5. **Track data quality** - Include validation and quality check results
+
+## Error Handling
+
+```python
+try:
+    record_gcs_to_bq_lineage(...)
+except Exception as e:
+    logger.warning(f"Failed to record lineage (non-fatal): {e}")
+    # Don't fail the main operation due to lineage errors
+    # Lineage recording is important but not critical
+```
+
+## Configuration
+
+Add lineage configuration to environment variables:
+
+```bash
+# .env.example
+
+# Lineage Configuration
+LINEAGE_ENABLED=true
+LINEAGE_LOCATION=us-central1  # GCP region for lineage API
+
+# Source System Documentation
+SOURCE_SYSTEM_NAME=my_pipeline  # Name of your data pipeline
+SOURCE_SYSTEM_OWNER=data-engineering-team  # Team responsible
+
+# External Source Metadata (optional, for documentation)
+EXTERNAL_API_BASE_URL=https://api.example.com
+EXTERNAL_DB_HOST=prod-db.example.com
+EXTERNAL_SAAS_ORG=myorg.salesforce.com
+```
+
+## Required IAM Permissions
+
+The service account needs:
+- `roles/datalineage.admin` - Create and manage lineage resources
+- `roles/datalineage.viewer` - Query lineage information
+
+See [docs/ACLS.md](mdc:docs/ACLS.md) for complete permission documentation.
+
+## Summary: Lineage Tracking Checklist
+
+### When Writing to BigQuery
+
+- [ ] Record start_time before operation
+- [ ] Wrap operation in try/finally
+- [ ] Use `bigquery:project.dataset.table` FQN format
+- [ ] Record lineage in finally block (always, even on failure)
+- [ ] Include source FQN (GCS, API, or other BigQuery table)
+- [ ] Set run state appropriately (COMPLETED/FAILED)
+- [ ] Log lineage creation
+
+### When Writing to GCS
+
+- [ ] Record start_time before upload
+- [ ] Wrap operation in try/finally
+- [ ] Use full `gs://bucket/path/file` URI
+- [ ] Include timestamp in file path for auditability
+- [ ] Document file format in process attributes
+- [ ] Record lineage with source system information
+- [ ] Track extraction method (full, incremental, real-time)
+
+### When Ingesting from External Sources
+
+- [ ] Create descriptive FQN for source (API, database, SaaS)
+- [ ] Document source system name in process attributes
+- [ ] Document source type (rest_api, jdbc, saas_api, streaming)
+- [ ] Document extraction method (full, incremental, delta)
+- [ ] Include API version or timestamp in FQN when available
+- [ ] Track authentication method used
+- [ ] Record data freshness indicators
+- [ ] Log extraction metadata (rate limits, pagination, filters)
+
+### For Multi-Stage Pipelines
+
+- [ ] Record lineage for EACH stage
+- [ ] Use consistent FQNs across stages
+- [ ] Document transformation at each stage
+- [ ] Link stages with consistent process names
+- [ ] Track data quality at each step
+
+## References
+
+- [Data Catalog Lineage API Documentation](https://cloud.google.com/data-catalog/docs/how-to/track-lineage)
+- [Python Client Library](https://cloud.google.com/python/docs/reference/lineage/latest)
+- [Lineage Best Practices](https://cloud.google.com/architecture/architecture-data-catalog-lineage-best-practices)
+- Example implementation: See provided code snippets above

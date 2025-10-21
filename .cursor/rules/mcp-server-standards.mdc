@@ -1,0 +1,488 @@
+---
+alwaysApply: true
+---
+
+# MCP Server Implementation Standards
+
+All MCP (Model Context Protocol) servers in this workspace **MUST** implement the following transport mechanisms and protocols to ensure seamless integration with Cursor and other MCP clients.
+
+## Overview
+
+The Model Context Protocol (MCP) is an open standard that enables AI assistants to securely access tools, data, and context from external systems. This document defines implementation standards for MCP servers in this workspace.
+
+**Key Principles**:
+- **Stdio-first**: Prioritize stdio transport for Cursor integration
+- **HTTP-optional**: Support HTTP for remote/containerized deployments
+- **JSON-RPC 2.0**: All communication uses JSON-RPC 2.0 protocol
+- **Security**: Never expose sensitive data without proper authentication
+
+## Required Transport Implementations
+
+### 1. Stdio Transport (Primary for Cursor)
+
+**Required for Cursor integration**
+
+- Must implement stdio transport using the MCP SDK
+- Cursor launches MCP servers as subprocesses and communicates via stdin/stdout
+- Used when `MCP_TRANSPORT=stdio` (default)
+- Enables direct subprocess integration with zero network exposure
+- Uses JSON-RPC 2.0 over stdin/stdout
+
+**Why Stdio First?**
+- Native Cursor integration method
+- No network ports required
+- Better security (no exposed endpoints)
+- Process isolation
+- Automatic lifecycle management by Cursor
+
+### 2. HTTP Transport (Secondary for Remote/Containers)
+
+**Optional but recommended for production deployments**
+
+- Should use FastAPI framework (Python) or equivalent
+- Must expose on configurable host/port via environment variables:
+  - `MCP_HOST` (default: `0.0.0.0`)
+  - `MCP_PORT` (default: `8080`)
+- Must use JSON-RPC 2.0 protocol for tool calls
+- Enables remote access and multi-client connections
+
+#### Required HTTP Endpoints
+
+All HTTP-enabled MCP servers must implement:
+
+- `GET /health` - Health check endpoint
+  - Returns: `{"status": "healthy", "service": "service-name", "transport": "http"}`
+  - Used by container orchestration (Docker, Kubernetes)
+- `GET /` - Service information or SSE endpoint
+  - Accept `application/json`: Returns service metadata
+  - Accept `text/event-stream`: Returns SSE stream for notifications
+- `GET /mcp/tools` - List available MCP tools
+  - Returns: JSON array of tool definitions with schemas
+- `POST /mcp/call-tool` - Execute an MCP tool via JSON-RPC
+  - Request body: `{"name": "tool_name", "arguments": {...}}`
+  - Returns: Tool execution results
+- `GET /mcp/resources` (optional) - List available resources
+  - Returns: JSON array of resource definitions
+- `GET /mcp/prompts` (optional) - List available prompts
+  - Returns: JSON array of prompt templates
+
+#### JSON-RPC Protocol
+
+All tool calls must follow JSON-RPC 2.0 specification:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "tools/call",
+  "params": {
+    "name": "tool_name",
+    "arguments": {...}
+  },
+  "id": 1
+}
+```
+
+### 2. Server-Sent Events (SSE) Support
+
+**Required for real-time notifications**
+
+- Must implement SSE endpoint at `GET /` when client sends `Accept: text/event-stream`
+- Used for streaming MCP notifications, progress updates, and events
+- Must properly format SSE messages:
+  ```
+  event: message
+  data: {"type": "notification", "content": "..."}
+  
+  ```
+
+### 3. MCP Protocol Features
+
+**Tool Definitions** (Required)
+
+All MCP servers must implement:
+- `list_tools()`: Return array of available tools with complete schemas
+- `call_tool(name, arguments)`: Execute a tool and return results
+
+Tool schemas must include:
+```python
+{
+    "name": "tool_name",
+    "description": "Clear description of what the tool does",
+    "inputSchema": {
+        "type": "object",
+        "properties": {...},
+        "required": [...]
+    }
+}
+```
+
+**Resources** (Optional)
+
+If your server provides data/content access:
+- `list_resources()`: Return available resources (files, data, etc.)
+- `read_resource(uri)`: Fetch resource content by URI
+
+**Prompts** (Optional)
+
+If your server provides prompt templates:
+- `list_prompts()`: Return available prompt templates
+- `get_prompt(name, arguments)`: Get rendered prompt with context
+
+## Configuration Management
+
+All MCP servers must support transport selection via environment variable:
+
+```bash
+# HTTP Transport (production/containers)
+MCP_TRANSPORT=http
+MCP_HOST=0.0.0.0
+MCP_PORT=8080
+
+# Stdio Transport (local/subprocess)
+MCP_TRANSPORT=stdio
+```
+
+## Implementation References
+
+### Data Discovery Agent
+
+- HTTP Server: [src/data_discovery_agent/mcp/http_server.py](mdc:data-discovery-agent/src/data_discovery_agent/mcp/http_server.py)
+- Stdio Server: [src/data_discovery_agent/mcp/server.py](mdc:data-discovery-agent/src/data_discovery_agent/mcp/server.py)
+- Configuration: [src/data_discovery_agent/mcp/config.py](mdc:data-discovery-agent/mcp/config.py)
+- Handlers: [src/data_discovery_agent/mcp/handlers.py](mdc:data-discovery-agent/mcp/handlers.py)
+
+### Query Generation Agent
+
+- HTTP Server: [src/query_generation_agent/mcp/http_server.py](mdc:query-generation-agent/src/query_generation_agent/mcp/http_server.py)
+- Stdio Server: [src/query_generation_agent/mcp/server.py](mdc:query-generation-agent/src/query_generation_agent/mcp/server.py)
+- Configuration: [src/query_generation_agent/mcp/config.py](mdc:query-generation-agent/src/query_generation_agent/mcp/config.py)
+- Handlers: [src/query_generation_agent/mcp/handlers.py](mdc:query-generation-agent/mcp/handlers.py)
+
+## Server Structure Template
+
+```python
+# server.py - Main entry point with stdio support
+from .config import load_config
+
+def run_server() -> None:
+    config = load_config()
+    
+    if config.mcp_transport.lower() == "http":
+        from .http_server import run_http_server
+        run_http_server(host=config.mcp_host, port=config.mcp_port)
+    else:
+        # stdio transport
+        asyncio.run(main())
+
+# http_server.py - HTTP/SSE implementation
+from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse
+
+def create_http_app() -> FastAPI:
+    app = FastAPI()
+    
+    @app.get("/health")
+    async def health_check():
+        return {"status": "healthy"}
+    
+    @app.get("/")
+    async def root(request: Request):
+        if "text/event-stream" in request.headers.get("accept", ""):
+            # Return SSE stream
+            return StreamingResponse(
+                event_stream(),
+                media_type="text/event-stream"
+            )
+        return {"service": "mcp-server"}
+    
+    @app.get("/mcp/tools")
+    async def list_tools():
+        # Return tool definitions
+        pass
+    
+    @app.post("/mcp/call-tool")
+    async def call_tool(request: Request):
+        body = await request.json()
+        # Execute tool via JSON-RPC
+        pass
+    
+    return app
+```
+
+## Testing Requirements
+
+All MCP servers must include tests for:
+
+1. HTTP endpoint functionality
+2. JSON-RPC request/response handling
+3. SSE stream generation
+4. Stdio transport communication
+5. Tool execution through both transports
+
+## Cursor Configuration
+
+### Stdio Transport (Recommended)
+
+Add to `~/.cursor/mcp.json` or `<project>/.cursor/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "service-name": {
+      "command": "python",
+      "args": ["-m", "your_package.mcp"],
+      "env": {
+        "GCP_PROJECT_ID": "your-project",
+        "MCP_TRANSPORT": "stdio"
+      }
+    }
+  }
+}
+```
+
+**Best Practices**:
+- Use absolute paths for `command` if not in PATH
+- Set `MCP_TRANSPORT=stdio` explicitly
+- Include all required environment variables in `env`
+- Use project-specific `.cursor/mcp.json` for team sharing
+
+### HTTP Transport (for Remote Servers)
+
+Add to `~/.cursor/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "service-name": {
+      "url": "http://localhost:8080"
+    }
+  }
+}
+```
+
+**Use Cases**:
+- MCP server running in Docker container
+- Remote server on different machine
+- Cursor Remote over SSH/Remote Explorer
+- Shared MCP server for multiple users
+
+### Configuration File Locations
+
+1. **Global**: `~/.cursor/mcp.json` - Available across all projects
+2. **Project**: `<project>/.cursor/mcp.json` - Project-specific configuration
+3. **Priority**: Project configuration overrides global configuration
+
+## Security Considerations
+
+### Authentication & Authorization
+
+**For Stdio Transport**:
+- Process-level isolation provides basic security
+- No network exposure
+- Credentials via environment variables only
+- Never log sensitive data to stdout/stderr
+
+**For HTTP Transport**:
+
+*Production Requirements*:
+- **MUST** implement authentication (API keys, OAuth, JWT) OR rely on upstream gateway
+- Use HTTPS in production (not HTTP)
+- Implement rate limiting to prevent abuse
+- Validate all inputs to prevent injection attacks
+- Use CORS policies to restrict origins
+
+*Development/Local Environments*:
+- Authentication can be disabled via environment variable (e.g., `MCP_AUTH_ENABLED=false`)
+- Only use unauthenticated mode on `localhost` or in isolated networks
+- Never deploy unauthenticated HTTP servers to public networks
+- Consider using host-based restrictions (`MCP_HOST=127.0.0.1`)
+
+*Upstream Authentication Patterns*:
+
+MCP servers may delegate authentication to upstream services:
+
+**Option 1: API Gateway Authentication**
+```python
+# API Gateway (Kong, AWS API Gateway, etc.) handles auth
+# MCP server receives pre-validated requests
+# Optionally validate gateway headers for defense-in-depth
+
+if os.getenv("MCP_AUTH_MODE") == "gateway":
+    # Trust requests from gateway (internal network)
+    # Optionally verify gateway signature header
+    pass
+```
+
+**Option 2: OAuth/JWT Token Validation**
+```python
+# MCP server validates OAuth/JWT tokens from upstream auth service
+
+import jwt
+from fastapi import HTTPException, Header
+
+async def verify_token(authorization: str = Header(None)):
+    if not os.getenv("MCP_AUTH_ENABLED", "true").lower() == "true":
+        return None  # Auth disabled for dev
+    
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "Missing or invalid token")
+    
+    token = authorization.split(" ")[1]
+    try:
+        # Validate JWT from upstream OAuth provider
+        payload = jwt.decode(
+            token, 
+            os.getenv("JWT_SECRET"), 
+            algorithms=["HS256"]
+        )
+        return payload
+    except jwt.InvalidTokenError:
+        raise HTTPException(401, "Invalid token")
+
+@app.get("/mcp/tools", dependencies=[Depends(verify_token)])
+async def list_tools():
+    # Protected endpoint
+    pass
+```
+
+**Option 3: API Key Authentication**
+```python
+# Simple API key for internal services
+
+async def verify_api_key(x_api_key: str = Header(None)):
+    if not os.getenv("MCP_AUTH_ENABLED", "true").lower() == "true":
+        return None  # Auth disabled for dev
+    
+    expected_key = os.getenv("MCP_API_KEY")
+    if not expected_key:
+        raise HTTPException(500, "API key not configured")
+    
+    if x_api_key != expected_key:
+        raise HTTPException(401, "Invalid API key")
+
+@app.get("/mcp/tools", dependencies=[Depends(verify_api_key)])
+async def list_tools():
+    # Protected endpoint
+    pass
+```
+
+**Configuration Example**:
+```bash
+# Production with auth
+MCP_AUTH_ENABLED=true
+MCP_AUTH_MODE=jwt  # or 'gateway', 'api_key'
+JWT_SECRET=your-jwt-secret
+# OR
+MCP_API_KEY=your-api-key-here
+
+# Development without auth (localhost only)
+MCP_AUTH_ENABLED=false
+MCP_HOST=127.0.0.1  # Restrict to localhost
+MCP_PORT=8080
+```
+
+### Credential Management
+
+- **NEVER** hardcode credentials in code
+- Use environment variables for all secrets
+- Provide `.env.example` (without real values)
+- Document required environment variables
+- Support credential rotation without code changes
+
+### Data Privacy
+
+- Log only non-sensitive information
+- Sanitize outputs before returning to client
+- Respect PII/PHI flags in data
+- Implement audit logging for sensitive operations
+
+## Deployment Considerations
+
+| Scenario | Transport | Configuration | Authentication |
+|----------|-----------|---------------|----------------|
+| **Cursor Local** | stdio | Default, best security | Not required |
+| **Local Development** | http | `localhost:8080` | Optional (can disable) |
+| **Cursor Remote (SSH)** | stdio | Server runs on remote host | Not required |
+| **Cursor Remote (HTTP)** | http | Use `localhost` on remote | Optional (internal network) |
+| **Docker/Kubernetes (Internal)** | http | Health checks, multi-client | Gateway or API key |
+| **Docker/Kubernetes (Public)** | http | Behind load balancer | **Required** (JWT/OAuth) |
+| **Team Sharing** | http | Central server, HTTPS | **Required** (JWT/OAuth) |
+| **CI/CD Testing** | stdio | Fast, isolated tests | Not required |
+
+**Authentication Decision Guide**:
+- **No auth needed**: stdio transport, localhost-only HTTP, internal networks
+- **Auth optional**: Development environments, internal Docker networks
+- **Auth required**: Public endpoints, shared servers, production deployments
+
+## Tool Design Best Practices
+
+### Input Schemas
+
+- Use JSON Schema for all tool inputs
+- Make schemas strict (avoid `additionalProperties: true`)
+- Provide clear descriptions for every field
+- Use enums for fixed value sets
+- Set appropriate `required` fields
+
+**Example**:
+```python
+{
+    "type": "object",
+    "properties": {
+        "query": {
+            "type": "string",
+            "description": "Search query in natural language",
+            "minLength": 1
+        },
+        "max_results": {
+            "type": "integer",
+            "description": "Maximum number of results to return",
+            "minimum": 1,
+            "maximum": 100,
+            "default": 10
+        }
+    },
+    "required": ["query"]
+}
+```
+
+### Output Format
+
+- Return structured JSON when possible
+- Use markdown for human-readable content
+- Include metadata (timestamps, sources, etc.)
+- Handle errors gracefully with clear messages
+- Return partial results when appropriate
+
+### Error Handling
+
+- Use standard error format:
+```json
+{
+    "error": {
+        "code": "INVALID_INPUT",
+        "message": "Clear error message",
+        "details": {...}
+    }
+}
+```
+
+## Documentation Requirements
+
+Each MCP server must provide:
+
+1. **README.md**: Overview, features, setup instructions
+2. **Tool Documentation**: Complete reference for each tool with examples
+3. **Environment Variables**: `.env.example` with all required variables
+4. **Cursor Integration Guide**: How to configure in `mcp.json`
+5. **Architecture Docs**: How the server works internally
+6. **Troubleshooting Guide**: Common issues and solutions
+
+See [docs/MCP_CLIENT_GUIDE.md](mdc:data-discovery-agent/docs/MCP_CLIENT_GUIDE.md) as a reference example.
+
+## References
+
+- [MCP Specification](https://spec.modelcontextprotocol.io/)
+- [Cursor MCP Documentation](https://cursor.com/docs/context/mcp)
+- [MCP TypeScript SDK](https://github.com/modelcontextprotocol/typescript-sdk)
+- [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk)

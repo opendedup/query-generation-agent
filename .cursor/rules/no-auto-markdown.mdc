@@ -1,0 +1,52 @@
+---
+alwaysApply: true
+---
+
+# Markdown File Creation Policy
+
+## Do Not Create New Markdown Files Automatically
+
+**NEVER proactively create new markdown files** such as:
+- README.md
+- CHANGELOG.md
+- CONTRIBUTING.md
+- Documentation files (*.md)
+- Any other markdown files
+
+This includes:
+- When completing code tasks
+- When setting up new projects
+- When making changes to existing code
+- As part of "best practices" or "helpful additions"
+
+## Updating Existing Markdown Files
+
+**It is OK to update existing markdown files** as part of your coding work if:
+- The file already exists in the codebase
+- The update is relevant to the code changes being made
+- The update keeps the documentation accurate and in sync with the code
+
+## When New Markdown Files ARE Allowed
+
+Only create new markdown files when:
+1. The user **explicitly requests** creation of a markdown file
+2. The user asks for documentation to be written
+3. The user specifically mentions creating a README, CHANGELOG, or other .md file
+
+## Examples
+
+❌ **DON'T DO THIS:**
+- User: "Create a new Python module for data processing"
+- Agent: Creates module.py AND automatically creates README.md
+
+✅ **DO THIS:**
+- User: "Create a new Python module for data processing"
+- Agent: Creates only module.py
+
+✅ **THIS IS ALSO FINE:**
+- User: "Add a new API endpoint for user authentication"
+- Agent: Creates the endpoint AND updates existing API.md with the new endpoint details
+
+✅ **THIS IS FINE TOO:**
+- User: "Create a README for the data processing module"
+- Agent: Creates README.md as explicitly requested
