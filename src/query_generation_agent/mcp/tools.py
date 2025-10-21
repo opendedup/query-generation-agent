@@ -2,6 +2,9 @@
 MCP Tool Definitions
 
 Defines available tools for the Query Generation Agent MCP server.
+
+Note: The datasets parameter accepts the BigQuery writer schema format
+(DiscoveredAssetDict) from the data-discovery-agent for seamless integration.
 """
 
 from mcp.types import Tool
@@ -36,10 +39,19 @@ def get_available_tools() -> list[Tool]:
                     },
                     "datasets": {
                         "type": "array",
-                        "description": "Array of dataset metadata from data discovery",
+                        "description": (
+                            "Array of dataset metadata from data discovery in BigQuery writer schema format "
+                            "(DiscoveredAssetDict). Output from get_datasets_for_query_generation tool can be "
+                            "passed directly to this parameter."
+                        ),
                         "items": {
                             "type": "object",
                             "properties": {
+                                # Core identifiers
+                                "table_id": {
+                                    "type": "string",
+                                    "description": "BigQuery table ID"
+                                },
                                 "project_id": {
                                     "type": "string",
                                     "description": "GCP project ID"
@@ -48,42 +60,46 @@ def get_available_tools() -> list[Tool]:
                                     "type": "string",
                                     "description": "BigQuery dataset ID"
                                 },
-                                "table_id": {
-                                    "type": "string",
-                                    "description": "BigQuery table ID"
+                                # Metadata
+                                "description": {
+                                    "type": ["string", "null"],
+                                    "description": "Table description"
+                                },
+                                "table_type": {
+                                    "type": ["string", "null"],
+                                    "description": "Table type (TABLE, VIEW, MATERIALIZED_VIEW, etc.)"
                                 },
                                 "asset_type": {
                                     "type": "string",
-                                    "description": "Asset type (table, view, etc.)"
+                                    "description": "Asset type (table, view, etc.) - same as table_type"
                                 },
+                                # Timestamps
+                                "created": {
+                                    "type": ["string", "null"],
+                                    "description": "Creation timestamp (ISO format)"
+                                },
+                                "last_modified": {
+                                    "type": ["string", "null"],
+                                    "description": "Last modified timestamp (ISO format)"
+                                },
+                                "last_accessed": {
+                                    "type": ["string", "null"],
+                                    "description": "Last accessed timestamp (ISO format)"
+                                },
+                                # Statistics
                                 "row_count": {
                                     "type": ["integer", "null"],
                                     "description": "Number of rows"
-                                },
-                                "size_bytes": {
-                                    "type": ["integer", "null"],
-                                    "description": "Size in bytes"
                                 },
                                 "column_count": {
                                     "type": ["integer", "null"],
                                     "description": "Number of columns"
                                 },
-                                "schema_fields": {
-                                    "type": "array",
-                                    "description": "Schema fields with names, types, and descriptions",
-                                    "items": {
-                                        "type": "object",
-                                        "properties": {
-                                            "name": {"type": "string"},
-                                            "type": {"type": "string"},
-                                            "description": {"type": "string"}
-                                        }
-                                    }
+                                "size_bytes": {
+                                    "type": ["integer", "null"],
+                                    "description": "Size in bytes"
                                 },
-                                "full_markdown": {
-                                    "type": "string",
-                                    "description": "Complete markdown documentation"
-                                },
+                                # Security & Governance
                                 "has_pii": {
                                     "type": "boolean",
                                     "description": "Contains PII data"
@@ -94,19 +110,110 @@ def get_available_tools() -> list[Tool]:
                                 },
                                 "environment": {
                                     "type": ["string", "null"],
-                                    "description": "Environment (prod, staging, dev)"
+                                    "description": "Environment (PROD, DEV, STAGING, etc.)"
+                                },
+                                # Labels and tags
+                                "labels": {
+                                    "type": "array",
+                                    "description": "Key-value labels",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "key": {"type": "string"},
+                                            "value": {"type": "string"}
+                                        }
+                                    }
+                                },
+                                # Schema
+                                "schema": {
+                                    "type": "array",
+                                    "description": "Schema fields with names, types, modes, descriptions, and sample values",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "name": {"type": "string"},
+                                            "type": {"type": "string"},
+                                            "mode": {"type": ["string", "null"]},
+                                            "description": {"type": ["string", "null"]},
+                                            "sample_values": {
+                                                "type": ["array", "null"],
+                                                "items": {"type": "string"}
+                                            }
+                                        }
+                                    }
+                                },
+                                # AI-generated insights
+                                "analytical_insights": {
+                                    "type": "array",
+                                    "description": "AI-generated analytical insights",
+                                    "items": {"type": "string"}
+                                },
+                                # Lineage
+                                "lineage": {
+                                    "type": "array",
+                                    "description": "Lineage relationships",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "source": {"type": "string"},
+                                            "target": {"type": "string"}
+                                        }
+                                    }
+                                },
+                                # Profiling
+                                "column_profiles": {
+                                    "type": "array",
+                                    "description": "Column profiling statistics",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "column_name": {"type": "string"},
+                                            "profile_type": {"type": ["string", "null"]},
+                                            "min_value": {"type": ["string", "null"]},
+                                            "max_value": {"type": ["string", "null"]},
+                                            "avg_value": {"type": ["string", "null"]},
+                                            "distinct_count": {"type": ["integer", "null"]},
+                                            "null_percentage": {"type": ["number", "null"]}
+                                        }
+                                    }
+                                },
+                                # Metrics
+                                "key_metrics": {
+                                    "type": "array",
+                                    "description": "Key metrics (completeness, freshness, cost, etc.)",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "metric_name": {"type": "string"},
+                                            "metric_value": {"type": "string"}
+                                        }
+                                    }
+                                },
+                                # Run metadata
+                                "run_timestamp": {
+                                    "type": "string",
+                                    "description": "Run timestamp (ISO format)"
+                                },
+                                "insert_timestamp": {
+                                    "type": "string",
+                                    "description": "Insert timestamp (ISO format or 'AUTO')"
+                                },
+                                # Additional MCP fields
+                                "full_markdown": {
+                                    "type": ["string", "null"],
+                                    "description": "Complete markdown documentation"
                                 },
                                 "owner_email": {
                                     "type": ["string", "null"],
-                                    "description": "Dataset owner email"
+                                    "description": "Asset owner email"
                                 },
                                 "tags": {
                                     "type": "array",
-                                    "description": "Dataset tags",
+                                    "description": "Additional tags",
                                     "items": {"type": "string"}
                                 }
                             },
-                            "required": ["project_id", "dataset_id", "table_id", "asset_type", "schema_fields", "full_markdown"]
+                            "required": ["table_id", "project_id", "dataset_id", "asset_type", "schema"]
                         },
                         "minItems": 1
                     },

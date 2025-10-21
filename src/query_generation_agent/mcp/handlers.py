@@ -205,6 +205,15 @@ class MCPHandlers:
         datasets = []
         
         for ds_data in datasets_data:
+            # Map BigQuery schema format to DatasetMetadata format
+            # BigQuery format uses "schema" while DatasetMetadata uses "schema_fields"
+            if "schema" in ds_data and "schema_fields" not in ds_data:
+                ds_data["schema_fields"] = ds_data["schema"]
+            
+            # Map table_type to asset_type if asset_type is missing
+            if "table_type" in ds_data and "asset_type" not in ds_data:
+                ds_data["asset_type"] = ds_data["table_type"]
+            
             # Set defaults for optional fields
             ds_data.setdefault("row_count", None)
             ds_data.setdefault("size_bytes", None)
@@ -214,6 +223,7 @@ class MCPHandlers:
             ds_data.setdefault("environment", None)
             ds_data.setdefault("owner_email", None)
             ds_data.setdefault("tags", [])
+            ds_data.setdefault("full_markdown", "")
             
             dataset = DatasetMetadata(**ds_data)
             datasets.append(dataset)

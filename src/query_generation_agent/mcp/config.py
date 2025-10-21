@@ -29,7 +29,7 @@ class QueryGenerationConfig(BaseModel):
     max_query_iterations: int = Field(default=10, description="Max refinement iterations")
     max_queries_per_insight: int = Field(default=5, description="Max queries to generate")
     query_timeout_seconds: int = Field(default=120, description="Query execution timeout")
-    gemini_model: str = Field(default="gemini-2.5-pro-latest", description="Gemini model")
+    gemini_model: str = Field(default="gemini-2.5-pro", description="Gemini model")
     alignment_threshold: float = Field(default=0.85, description="Min alignment score")
     
     # MCP Service Configuration

@@ -105,8 +105,9 @@ def test_config_validation_log_level() -> None:
 
 def test_load_config_missing_required(mocker: "MockerFixture") -> None:
     """Test load_config with missing required variables."""
-    # Mock environment variables
+    # Mock environment variables and disable .env file loading
     mocker.patch.dict(os.environ, {}, clear=True)
+    mocker.patch("query_generation_agent.mcp.config.load_dotenv")
     
     # Should raise ValueError for missing GCP_PROJECT_ID
     with pytest.raises(ValueError, match="GCP_PROJECT_ID environment variable is required"):
@@ -141,4 +142,139 @@ def test_load_config_success(mocker: "MockerFixture") -> None:
     assert config.mcp_transport == "http"
     assert config.mcp_port == 9000
     assert config.log_level == "DEBUG"
+
+
+def test_config_auth_defaults() -> None:
+    """Test authentication configuration defaults."""
+    config = QueryGenerationConfig(
+        project_id="test-project",
+        bq_execution_project="test-project",
+        gemini_api_key="test-key"
+    )
+    
+    assert config.mcp_auth_enabled is False
+    assert config.mcp_auth_mode == "api_key"
+    assert config.mcp_api_key is None
+    assert config.jwt_secret is None
+    assert config.jwt_algorithm == "HS256"
+
+
+def test_config_auth_validation_mode() -> None:
+    """Test authentication mode validation."""
+    # Valid auth modes
+    for mode in ["api_key", "jwt", "gateway"]:
+        config = QueryGenerationConfig(
+            project_id="test-project",
+            bq_execution_project="test-project",
+            gemini_api_key="test-key",
+            mcp_auth_mode=mode
+        )
+        assert config.mcp_auth_mode == mode
+    
+    # Invalid auth mode
+    with pytest.raises(ValueError, match="mcp_auth_mode must be one of"):
+        QueryGenerationConfig(
+            project_id="test-project",
+            bq_execution_project="test-project",
+            gemini_api_key="test-key",
+            mcp_auth_mode="invalid"
+        )
+
+
+def test_config_auth_api_key() -> None:
+    """Test API key authentication configuration."""
+    config = QueryGenerationConfig(
+        project_id="test-project",
+        bq_execution_project="test-project",
+        gemini_api_key="test-key",
+        mcp_auth_enabled=True,
+        mcp_auth_mode="api_key",
+        mcp_api_key="secret-api-key-123"
+    )
+    
+    assert config.mcp_auth_enabled is True
+    assert config.mcp_auth_mode == "api_key"
+    assert config.mcp_api_key == "secret-api-key-123"
+
+
+def test_config_auth_jwt() -> None:
+    """Test JWT authentication configuration."""
+    config = QueryGenerationConfig(
+        project_id="test-project",
+        bq_execution_project="test-project",
+        gemini_api_key="test-key",
+        mcp_auth_enabled=True,
+        mcp_auth_mode="jwt",
+        jwt_secret="jwt-secret-key",
+        jwt_algorithm="HS256"
+    )
+    
+    assert config.mcp_auth_enabled is True
+    assert config.mcp_auth_mode == "jwt"
+    assert config.jwt_secret == "jwt-secret-key"
+    assert config.jwt_algorithm == "HS256"
+
+
+def test_load_config_auth_disabled(mocker: "MockerFixture") -> None:
+    """Test load_config with authentication disabled."""
+    mocker.patch.dict(os.environ, {
+        "GCP_PROJECT_ID": "test-project",
+        "GEMINI_API_KEY": "test-key",
+        "MCP_AUTH_ENABLED": "false"
+    }, clear=True)
+    
+    config = load_config()
+    
+    assert config.mcp_auth_enabled is False
+
+
+def test_load_config_auth_api_key(mocker: "MockerFixture") -> None:
+    """Test load_config with API key authentication."""
+    mocker.patch.dict(os.environ, {
+        "GCP_PROJECT_ID": "test-project",
+        "GEMINI_API_KEY": "test-key",
+        "MCP_AUTH_ENABLED": "true",
+        "MCP_AUTH_MODE": "api_key",
+        "MCP_API_KEY": "test-secret-key"
+    }, clear=True)
+    
+    config = load_config()
+    
+    assert config.mcp_auth_enabled is True
+    assert config.mcp_auth_mode == "api_key"
+    assert config.mcp_api_key == "test-secret-key"
+
+
+def test_load_config_auth_jwt(mocker: "MockerFixture") -> None:
+    """Test load_config with JWT authentication."""
+    mocker.patch.dict(os.environ, {
+        "GCP_PROJECT_ID": "test-project",
+        "GEMINI_API_KEY": "test-key",
+        "MCP_AUTH_ENABLED": "true",
+        "MCP_AUTH_MODE": "jwt",
+        "JWT_SECRET": "jwt-secret",
+        "JWT_ALGORITHM": "HS512"
+    }, clear=True)
+    
+    config = load_config()
+    
+    assert config.mcp_auth_enabled is True
+    assert config.mcp_auth_mode == "jwt"
+    assert config.jwt_secret == "jwt-secret"
+    assert config.jwt_algorithm == "HS512"
+
+
+def test_load_config_auth_gateway(mocker: "MockerFixture") -> None:
+    """Test load_config with gateway authentication."""
+    mocker.patch.dict(os.environ, {
+        "GCP_PROJECT_ID": "test-project",
+        "GEMINI_API_KEY": "test-key",
+        "MCP_AUTH_ENABLED": "true",
+        "MCP_AUTH_MODE": "gateway"
+    }, clear=True)
+    
+    config = load_config()
+    
+    assert config.mcp_auth_enabled is True
+    assert config.mcp_auth_mode == "gateway"
 
