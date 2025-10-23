@@ -139,6 +139,76 @@ for query in response["queries"]:
         print(f"Alignment: {query['alignment_score']}")
 ```
 
+### Async Query Generation (Recommended for Long Operations)
+
+For query generation tasks that may take more than 30 seconds, use the async endpoints to prevent client timeouts:
+
+**How it works:**
+1. **Start Task**: POST to `/mcp/call-tool-async` returns immediately with a `task_id` (HTTP 202)
+2. **Poll Status**: GET `/mcp/tasks/{task_id}` to check progress (pending → running → completed/failed)
+3. **Retrieve Result**: GET `/mcp/tasks/{task_id}/result` when status is completed
+
+**Example:**
+
+```python
+import asyncio
+import httpx
+
+async def generate_queries_async(insight, datasets):
+    async with httpx.AsyncClient() as client:
+        # 1. Start async task
+        response = await client.post(
+            "http://localhost:8081/mcp/call-tool-async",
+            json={
+                "name": "generate_queries",
+                "arguments": {
+                    "insight": insight,
+                    "datasets": datasets,
+                    "max_queries": 3
+                }
+            },
+            timeout=30  # Short timeout for starting task
+        )
+        
+        task_data = response.json()
+        task_id = task_data["task_id"]
+        status_url = f"http://localhost:8081{task_data['status_url']}"
+        
+        print(f"Task started: {task_id}")
+        
+        # 2. Poll for completion
+        while True:
+            await asyncio.sleep(5)  # Poll every 5 seconds
+            
+            status_response = await client.get(status_url)
+            status_data = status_response.json()
+            
+            print(f"Status: {status_data['status']}")
+            
+            if status_data["status"] == "completed":
+                # 3. Retrieve result
+                result_url = f"http://localhost:8081{status_data['result_url']}"
+                result = await client.get(result_url)
+                return result.json()["result"]
+            
+            elif status_data["status"] == "failed":
+                raise Exception(f"Task failed: {status_data.get('error')}")
+
+# Usage
+result = await generate_queries_async(
+    insight="What are the top 10 customers by revenue?",
+    datasets=[...]
+)
+```
+
+**Benefits:**
+- No client timeouts on long-running operations (1-2+ minutes)
+- Clear progress tracking with status checks
+- Can handle multiple concurrent requests
+- Backward compatible (sync endpoint `/mcp/call-tool` still available)
+
+**Note:** The `integrated_workflow_example.py` automatically uses async endpoints when available. See `examples/integrated_workflow_example.py` for a complete working example.
+
 ## Integration with Data Discovery Agent
 
 This service is designed to work downstream from the data-discovery-agent:

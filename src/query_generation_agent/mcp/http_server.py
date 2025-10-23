@@ -7,6 +7,7 @@ Provides FastAPI-based HTTP server for containerized deployment with SSE support
 import asyncio
 import json
 import logging
+import uuid
 from typing import Any, AsyncGenerator, Dict, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
@@ -30,6 +31,7 @@ logger = logging.getLogger(__name__)
 config_instance: QueryGenerationConfig | None = None
 handlers_instance: MCPHandlers | None = None
 auth_middleware: AuthenticationMiddleware | None = None
+task_manager_instance: Any | None = None
 
 
 def create_http_app() -> FastAPI:
@@ -50,7 +52,7 @@ def create_http_app() -> FastAPI:
     @app.on_event("startup")
     async def startup_event() -> None:
         """Initialize server on startup."""
-        global config_instance, handlers_instance, auth_middleware
+        global config_instance, handlers_instance, auth_middleware, task_manager_instance
         
         logger.info("Initializing Query Generation Agent HTTP Server...")
         
@@ -88,6 +90,21 @@ def create_http_app() -> FastAPI:
                 bigquery_client=bigquery_client,
                 gemini_client=gemini_client
             )
+            
+            # Initialize task manager for async operations
+            logger.info("Initializing task manager...")
+            from .task_manager import TaskManager
+            task_manager_instance = TaskManager()
+            
+            # Start background task cleanup
+            async def cleanup_loop():
+                """Periodically cleanup old tasks."""
+                while True:
+                    await asyncio.sleep(300)  # Every 5 minutes
+                    task_manager_instance.cleanup_old_tasks(max_age_seconds=3600)
+            
+            asyncio.create_task(cleanup_loop())
+            logger.info("Task manager initialized with cleanup loop")
             
             logger.info("Server initialization complete")
             
@@ -269,6 +286,149 @@ def create_http_app() -> FastAPI:
         except Exception as e:
             logger.error(f"Error calling tool: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
+    
+    @app.post("/mcp/call-tool-async", dependencies=[Depends(verify_auth)])
+    async def call_tool_async(request: Request) -> JSONResponse:
+        """
+        Execute an MCP tool asynchronously.
+        
+        Returns task ID immediately for long-running operations.
+        Client polls status endpoint to check progress.
+        
+        Request body:
+            {
+                "name": "tool_name",
+                "arguments": {...}
+            }
+        
+        Returns:
+            202 Accepted with task_id and status URLs
+        """
+        if not handlers_instance or not task_manager_instance:
+            raise HTTPException(status_code=503, detail="MCP server not initialized")
+        
+        try:
+            body = await request.json()
+            
+            tool_name = body.get("name")
+            arguments = body.get("arguments", {})
+            
+            if not tool_name:
+                raise HTTPException(status_code=400, detail="Missing 'name' in request")
+            
+            # Generate task ID
+            task_id = str(uuid.uuid4())
+            
+            logger.info(f"Async tool called via HTTP: {tool_name}, task_id: {task_id}")
+            
+            # Create task
+            task_manager_instance.create_task(task_id)
+            
+            # Start background execution
+            from .tools import GENERATE_QUERIES_TOOL
+            
+            if tool_name == GENERATE_QUERIES_TOOL:
+                asyncio.create_task(
+                    handlers_instance.handle_generate_queries_async(
+                        task_id, arguments, task_manager_instance
+                    )
+                )
+            else:
+                raise HTTPException(status_code=404, detail=f"Unknown tool: {tool_name}")
+            
+            return JSONResponse(
+                status_code=202,
+                content={
+                    "task_id": task_id,
+                    "status": "pending",
+                    "status_url": f"/mcp/tasks/{task_id}",
+                    "result_url": f"/mcp/tasks/{task_id}/result",
+                    "message": "Task started. Poll status_url to check progress."
+                }
+            )
+            
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error starting async tool: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    @app.get("/mcp/tasks/{task_id}", dependencies=[Depends(verify_auth)])
+    async def get_task_status(task_id: str) -> Dict[str, Any]:
+        """
+        Get status of an async task.
+        
+        Args:
+            task_id: Task identifier
+        
+        Returns:
+            Task status and metadata
+        """
+        if not task_manager_instance:
+            raise HTTPException(status_code=503, detail="Task manager not initialized")
+        
+        task = task_manager_instance.get_task(task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
+        
+        from .task_manager import TaskStatus
+        
+        response = {
+            "task_id": task.id,
+            "status": task.status,
+            "created_at": task.created_at.isoformat(),
+        }
+        
+        if task.status == TaskStatus.COMPLETED:
+            response["result_url"] = f"/mcp/tasks/{task_id}/result"
+            if task.completed_at:
+                response["completed_at"] = task.completed_at.isoformat()
+        elif task.status == TaskStatus.FAILED:
+            response["error"] = task.error
+            if task.completed_at:
+                response["completed_at"] = task.completed_at.isoformat()
+        
+        return response
+    
+    @app.get("/mcp/tasks/{task_id}/result", dependencies=[Depends(verify_auth)])
+    async def get_task_result(task_id: str) -> Dict[str, Any]:
+        """
+        Get result of a completed task.
+        
+        Args:
+            task_id: Task identifier
+        
+        Returns:
+            Task result
+        """
+        if not task_manager_instance:
+            raise HTTPException(status_code=503, detail="Task manager not initialized")
+        
+        task = task_manager_instance.get_task(task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
+        
+        from .task_manager import TaskStatus
+        
+        if task.status == TaskStatus.RUNNING or task.status == TaskStatus.PENDING:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Task not yet completed. Current status: {task.status}"
+            )
+        
+        if task.status == TaskStatus.FAILED:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Task failed: {task.error}"
+            )
+        
+        # Extract text from result (which is Sequence[TextContent])
+        if task.result and len(task.result) > 0:
+            response_text = task.result[0].text
+            response_data = json.loads(response_text)
+            return {"result": response_data}
+        else:
+            return {"result": None}
     
     @app.exception_handler(Exception)
     async def global_exception_handler(request: Request, exc: Exception) -> JSONResponse:

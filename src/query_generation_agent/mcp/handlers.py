@@ -4,6 +4,7 @@ MCP Tool Handlers
 Implements the business logic for MCP tools.
 """
 
+import asyncio
 import json
 import logging
 import time
@@ -95,7 +96,9 @@ class MCPHandlers:
             logger.info(f"Max iterations: {request.max_iterations}")
             
             # Step 1: Generate initial query candidates
-            success, error_msg, candidates = self.query_ideator.generate_candidates(
+            # Run in thread pool to avoid blocking the async event loop
+            success, error_msg, candidates = await asyncio.to_thread(
+                self.query_ideator.generate_candidates,
                 insight=request.insight,
                 datasets=request.datasets,
                 num_queries=request.max_queries
@@ -123,7 +126,9 @@ class MCPHandlers:
                 try:
                     logger.info(f"Processing candidate {i+1}/{len(candidates)}")
                     
-                    query_result = self.query_refiner.refine_and_validate(
+                    # Run in thread pool to avoid blocking the async event loop
+                    query_result = await asyncio.to_thread(
+                        self.query_refiner.refine_and_validate,
                         candidate_id=candidate_id,
                         initial_sql=candidate["sql"],
                         description=candidate["description"],
@@ -239,4 +244,46 @@ class MCPHandlers:
         )
         
         return request
+    
+    async def handle_generate_queries_async(
+        self,
+        task_id: str,
+        arguments: Dict[str, Any],
+        task_manager: Any  # Avoid circular import
+    ) -> None:
+        """
+        Handle generate_queries tool request asynchronously.
+        
+        Executes query generation in background and updates task status.
+        Used for long-running operations to prevent client timeouts.
+        
+        Args:
+            task_id: Task identifier
+            arguments: Tool arguments
+            task_manager: TaskManager instance for updating status
+        """
+        from .task_manager import TaskStatus
+        
+        try:
+            logger.info(f"Starting async query generation for task {task_id}")
+            task_manager.update_task_status(task_id, TaskStatus.RUNNING)
+            
+            # Call existing handle_generate_queries logic
+            result = await self.handle_generate_queries(arguments)
+            
+            # Update task with result
+            task_manager.update_task_status(
+                task_id,
+                TaskStatus.COMPLETED,
+                result=result
+            )
+            logger.info(f"Async query generation completed for task {task_id}")
+            
+        except Exception as e:
+            logger.error(f"Async query generation failed for task {task_id}: {e}", exc_info=True)
+            task_manager.update_task_status(
+                task_id,
+                TaskStatus.FAILED,
+                error=str(e)
+            )
 

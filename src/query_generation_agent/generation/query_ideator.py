@@ -97,6 +97,14 @@ class QueryIdeator:
             return False, error_msg, []
         
         logger.info(f"Successfully generated {len(valid_queries)} valid query candidates")
+        
+        # Log each generated query for visibility
+        for i, query in enumerate(valid_queries, 1):
+            logger.info(f"Generated Query #{i}:")
+            logger.info(f"Description: {query['description']}")
+            logger.info(f"SQL:\n{query['sql']}")
+            logger.info("-" * 80)
+        
         return True, None, valid_queries
     
     def _prepare_datasets(self, datasets: List[DatasetMetadata]) -> List[Dict[str, Any]]:

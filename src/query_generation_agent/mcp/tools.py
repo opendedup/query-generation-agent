@@ -27,7 +27,10 @@ def get_available_tools() -> list[Tool]:
                 "Generate and validate BigQuery SQL queries from a data science insight. "
                 "Takes an insight (question) and dataset metadata, generates multiple query candidates, "
                 "validates them through iterative refinement, and returns validated queries with "
-                "alignment scores and descriptions."
+                "alignment scores and descriptions.\n\n"
+                "Note: For long-running operations (>30s), use the async endpoint "
+                "/mcp/call-tool-async which returns immediately with a task_id for status polling. "
+                "This prevents client timeouts on complex query generation tasks."
             ),
             inputSchema={
                 "type": "object",
@@ -240,6 +243,30 @@ def get_available_tools() -> list[Tool]:
                         "type": "boolean",
                         "description": "Allow joins across datasets (default: true)",
                         "default": True
+                    },
+                    "discovery_metadata": {
+                        "type": "object",
+                        "description": (
+                            "Optional metadata from PRP discovery process. Includes query execution details, "
+                            "refinements made, and summary statistics. Passed through from data-discovery-agent "
+                            "for full traceability of dataset selection."
+                        ),
+                        "properties": {
+                            "queries_executed": {
+                                "type": "array",
+                                "description": "List of queries executed during discovery",
+                                "items": {"type": "object"}
+                            },
+                            "refinements_made": {
+                                "type": "array",
+                                "description": "Query refinements applied during discovery",
+                                "items": {"type": "object"}
+                            },
+                            "summary": {
+                                "type": "object",
+                                "description": "Summary statistics of discovery process"
+                            }
+                        }
                     }
                 },
                 "required": ["insight", "datasets"]
