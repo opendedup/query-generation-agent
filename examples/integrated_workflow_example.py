@@ -9,7 +9,7 @@ This example demonstrates the complete end-to-end workflow:
 5. Generate SQL queries for each insight using query-generation-agent
 
 Prerequisites:
-- data-planning-agent running on http://localhost:8082
+- data-planning-agent running on http://localhost:8082 (not needed if using --prp-file)
 - data-discovery-agent running on http://localhost:8080
 - query-generation-agent running on http://localhost:8081
 
@@ -21,6 +21,10 @@ Usage:
     # Specify custom initial intent
     python integrated_workflow_example.py \
         --initial-intent "Analyze customer transaction patterns"
+    
+    # Load existing PRP from file (skip planning)
+    python integrated_workflow_example.py \
+        --prp-file output/prp_20250101_120000.md
     
     # Control planning turns and results
     python integrated_workflow_example.py \
@@ -215,6 +219,35 @@ class IntegratedMCPClient:
                 return result_text
             else:
                 raise ValueError("No PRP generated from planning agent")
+    
+    def load_prp_from_file(self, prp_file_path: str) -> str:
+        """
+        Load PRP text from a markdown file.
+        
+        Args:
+            prp_file_path: Path to PRP markdown file
+            
+        Returns:
+            PRP text content
+            
+        Raises:
+            FileNotFoundError: If file doesn't exist
+            ValueError: If file is empty
+        """
+        prp_path = Path(prp_file_path)
+        
+        if not prp_path.exists():
+            raise FileNotFoundError(f"PRP file not found: {prp_file_path}")
+        
+        if not prp_path.is_file():
+            raise ValueError(f"Path is not a file: {prp_file_path}")
+        
+        prp_text = prp_path.read_text()
+        
+        if not prp_text.strip():
+            raise ValueError(f"PRP file is empty: {prp_file_path}")
+        
+        return prp_text
     
     async def discover_datasets_from_prp(
         self,
@@ -998,6 +1031,7 @@ def print_all_query_results(
 
 async def main(
     initial_intent: Optional[str] = None,
+    prp_file: Optional[str] = None,
     max_results: int = 5,
     max_queries: int = 3,
     max_iterations: int = 10,
@@ -1013,6 +1047,7 @@ async def main(
     
     Args:
         initial_intent: Initial business intent for planning
+        prp_file: Path to existing PRP file (skips planning phase)
         max_results: Maximum datasets to discover from PRP
         max_queries: Maximum number of queries to generate per insight
         max_iterations: Maximum refinement iterations per query
@@ -1026,12 +1061,16 @@ async def main(
     print("=" * 100)
     print()
     
-    # Use default if not provided
-    if initial_intent is None:
+    # Check for mutual exclusivity and warn if both provided
+    if prp_file and initial_intent:
+        print("⚠️  Both --prp-file and --initial-intent provided. Using --prp-file (skipping planning).")
+        print()
+    
+    # Use default if not provided and no prp_file
+    if initial_intent is None and prp_file is None:
         initial_intent = "We want to analyze customer transaction patterns to identify high-value customers"
         print(f"ℹ️  Using default intent: '{initial_intent}'")
-    
-    print()
+        print()
     
     # Initialize client with output directory
     output_dir = "output"
@@ -1045,16 +1084,17 @@ async def main(
     print(f"📁 Output directory: {output_dir}/")
     print()
     
-    # Check health (all 3 agents)
+    # Check health (all 3 agents or skip planning if using prp_file)
     print("🏥 Checking service health...")
     health = await client.check_health()
     
-    # Check all three services
-    if not health["planning_agent"]:
-        print("   ✗ Data Planning Agent: unavailable")
-        print("   Please start: cd /home/user/git/data-planning-agent && poetry run python -m data_planning_agent.mcp")
-        return
-    print("   ✓ Data Planning Agent: healthy")
+    # Only check planning agent if not using prp_file
+    if not prp_file:
+        if not health["planning_agent"]:
+            print("   ✗ Data Planning Agent: unavailable")
+            print("   Please start: cd /home/user/git/data-planning-agent && poetry run python -m data_planning_agent.mcp")
+            return
+        print("   ✓ Data Planning Agent: healthy")
     
     if not health["discovery_agent"]:
         print("   ✗ Data Discovery Agent: unavailable")
@@ -1070,8 +1110,20 @@ async def main(
     
     print()
     
-    # Step 1: Interactive Planning (Q&A)
-    prp_text = await run_interactive_planning(client, initial_intent, max_planning_turns)
+    # Step 1: Get PRP (either from file or interactive planning)
+    if prp_file:
+        print(f"📄 Loading PRP from file: {prp_file}")
+        print()
+        try:
+            prp_text = client.load_prp_from_file(prp_file)
+            print("✓ PRP loaded successfully")
+            print()
+        except (FileNotFoundError, ValueError) as e:
+            print(f"✗ Error loading PRP file: {e}")
+            return
+    else:
+        # Interactive Planning (Q&A)
+        prp_text = await run_interactive_planning(client, initial_intent, max_planning_turns)
     
     # Step 2: Discover datasets from PRP
     datasets = await client.discover_datasets_from_prp(
@@ -1141,6 +1193,10 @@ Examples:
   python integrated_workflow_example.py \\
     --initial-intent "Analyze customer behavior patterns"
   
+  # Load existing PRP from file (skip planning)
+  python integrated_workflow_example.py \\
+    --prp-file output/prp_20250101_120000.md
+  
   # Control planning and query generation
   python integrated_workflow_example.py \\
     --initial-intent "Track product performance metrics" \\
@@ -1156,6 +1212,12 @@ Examples:
         "-i", "--initial-intent",
         type=str,
         help="Initial business intent for planning (e.g., 'Analyze customer behavior')"
+    )
+    
+    parser.add_argument(
+        "-p", "--prp-file",
+        type=str,
+        help="Path to existing PRP markdown file (skips planning phase)"
     )
     
     # Planning configuration
@@ -1232,6 +1294,7 @@ if __name__ == "__main__":
     # Run main workflow
     asyncio.run(main(
         initial_intent=args.initial_intent,
+        prp_file=args.prp_file,
         max_results=args.max_results,
         max_queries=args.max_queries,
         max_iterations=args.max_iterations,
