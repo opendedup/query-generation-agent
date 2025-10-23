@@ -19,7 +19,6 @@ from ..models.validation_models import (
 )
 from ..validation.alignment_validator import AlignmentValidator
 from ..validation.dryrun_validator import DryRunValidator
-from ..validation.syntax_validator import SyntaxValidator
 
 logger = logging.getLogger(__name__)
 
@@ -29,17 +28,15 @@ class QueryRefiner:
     Refines and validates queries through iterative feedback loop.
     
     Pipeline:
-    1. Syntax validation
-    2. Dry-run validation (BigQuery)
-    3. Sample execution
-    4. Alignment validation (LLM)
-    5. If any step fails, refine and retry
+    1. Dry-run validation (BigQuery) - validates syntax and semantics
+    2. Sample execution
+    3. Alignment validation (LLM)
+    4. If any step fails, refine and retry using BigQuery error messages
     """
     
     def __init__(
         self,
         gemini_client: GeminiClient,
-        syntax_validator: SyntaxValidator,
         dryrun_validator: DryRunValidator,
         alignment_validator: AlignmentValidator,
         max_iterations: int = 10
@@ -49,13 +46,11 @@ class QueryRefiner:
         
         Args:
             gemini_client: Gemini client for refinement
-            syntax_validator: Syntax validator
             dryrun_validator: Dry-run validator
             alignment_validator: Alignment validator
             max_iterations: Maximum refinement iterations per query
         """
         self.gemini_client = gemini_client
-        self.syntax_validator = syntax_validator
         self.dryrun_validator = dryrun_validator
         self.alignment_validator = alignment_validator
         self.max_iterations = max_iterations
@@ -190,25 +185,13 @@ class QueryRefiner:
         """
         validation_details = {}
         
-        # Stage 1: Syntax validation
-        logger.info("Stage 1: Syntax validation")
-        iter_state.current_stage = ValidationStage.SYNTAX
-        syntax_valid, syntax_error = self.syntax_validator.validate(sql)
-        iter_state.syntax_passed = syntax_valid
-        validation_details["syntax_valid"] = syntax_valid
+        # Skip custom syntax validation - let BigQuery be the source of truth
+        logger.info("Skipping custom syntax validation - BigQuery will validate")
+        iter_state.syntax_passed = True  # Mark as passed since we're not checking
+        validation_details["syntax_valid"] = True
         
-        if not syntax_valid:
-            logger.warning(f"Syntax validation failed: {syntax_error}")
-            iter_state.add_error(
-                stage=ValidationStage.SYNTAX,
-                error_type="syntax_error",
-                message=syntax_error or "SQL syntax is invalid"
-            )
-            return False, None, validation_details
-        logger.info("✓ Syntax validation passed")
-        
-        # Stage 2: Dry-run validation
-        logger.info("Stage 2: Dry-run validation (BigQuery)")
+        # Stage 1: Dry-run validation (BigQuery) - this validates syntax and semantics
+        logger.info("Stage 1: Dry-run validation (BigQuery)")
         iter_state.current_stage = ValidationStage.DRYRUN
         dryrun_valid, dryrun_error, stats = self.dryrun_validator.validate_dryrun(sql)
         iter_state.dryrun_passed = dryrun_valid
@@ -216,17 +199,19 @@ class QueryRefiner:
         validation_details["execution_stats"] = stats
         
         if not dryrun_valid:
-            logger.warning(f"Dry-run validation failed: {dryrun_error}")
+            logger.warning(f"BigQuery validation failed: {dryrun_error}")
+            logger.info(f"Query that failed:\n{sql}")
             iter_state.add_error(
                 stage=ValidationStage.DRYRUN,
                 error_type="bigquery_error",
-                message=dryrun_error or "Query failed dry-run validation"
+                message=dryrun_error or "Query failed BigQuery validation",
+                details={"sql": sql[:500]}  # Include first 500 chars for context
             )
             return False, None, validation_details
-        logger.info(f"✓ Dry-run validation passed (estimated {stats.get('total_bytes_processed', 0) / (1024*1024):.2f} MB)")
+        logger.info(f"✓ BigQuery validation passed (estimated {stats.get('total_bytes_processed', 0) / (1024*1024):.2f} MB)")
         
-        # Stage 3: Sample execution
-        logger.info("Stage 3: Sample execution")
+        # Stage 2: Sample execution
+        logger.info("Stage 2: Sample execution")
         iter_state.current_stage = ValidationStage.EXECUTION
         exec_success, exec_error, sample_rows, schema = self.dryrun_validator.execute_sample(sql)
         iter_state.execution_passed = exec_success
@@ -236,16 +221,18 @@ class QueryRefiner:
         
         if not exec_success:
             logger.warning(f"Sample execution failed: {exec_error}")
+            logger.info(f"Query that failed:\n{sql}")
             iter_state.add_error(
                 stage=ValidationStage.EXECUTION,
                 error_type="execution_error",
-                message=exec_error or "Query execution failed"
+                message=exec_error or "Query execution failed",
+                details={"sql": sql[:500]}
             )
             return False, None, validation_details
         logger.info(f"✓ Sample execution passed ({len(sample_rows) if sample_rows else 0} rows returned)")
         
-        # Stage 4: Alignment validation
-        logger.info("Stage 4: Alignment validation (AI checking if results match insight)")
+        # Stage 3: Alignment validation
+        logger.info("Stage 3: Alignment validation (AI checking if results match insight)")
         iter_state.current_stage = ValidationStage.ALIGNMENT
         aligned, align_error, score, reasoning = self.alignment_validator.validate(
             insight=insight,

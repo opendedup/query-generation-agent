@@ -5,7 +5,8 @@ This example demonstrates the complete end-to-end workflow:
 1. Gather requirements using data-planning-agent with interactive Q&A
 2. Generate a structured Data Product Requirement Prompt (PRP)
 3. Discover datasets using data-discovery-agent based on the PRP
-4. Generate SQL queries using query-generation-agent with the datasets and insight
+4. Extract insights from PRP grounded in discovered datasets (up to 3)
+5. Generate SQL queries for each insight using query-generation-agent
 
 Prerequisites:
 - data-planning-agent running on http://localhost:8082
@@ -13,13 +14,13 @@ Prerequisites:
 - query-generation-agent running on http://localhost:8081
 
 Usage:
-    # Use default initial intent and insight (interactive Q&A)
+    # Use default initial intent (interactive Q&A)
+    # Insights are automatically extracted from PRP
     python integrated_workflow_example.py
     
-    # Specify custom initial intent and insight
+    # Specify custom initial intent
     python integrated_workflow_example.py \
-        --initial-intent "Analyze customer transaction patterns" \
-        --query-insight "What are the top 10 customers by revenue?"
+        --initial-intent "Analyze customer transaction patterns"
     
     # Control planning turns and results
     python integrated_workflow_example.py \
@@ -32,10 +33,13 @@ Usage:
 import argparse
 import asyncio
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from dotenv import load_dotenv
+import google.generativeai as genai
 import httpx
 
 
@@ -47,7 +51,7 @@ class IntegratedMCPClient:
         planning_url: str = "http://localhost:8082",
         discovery_url: str = "http://localhost:8080",
         query_gen_url: str = "http://localhost:8081",
-        timeout: float = 300.0,
+        timeout: float = 600.0,
         output_dir: str = "output"
     ):
         """
@@ -270,7 +274,36 @@ class IntegratedMCPClient:
                 datasets = data.get("datasets", [])
                 metadata = data.get("discovery_metadata", {})
                 
-                print(f"✓ Found {len(datasets)} datasets")
+                print(f"✓ Found {len(datasets)} dataset candidates from discovery")
+                
+                # Filter out datasets with invalid identifiers
+                valid_datasets = []
+                filtered_count = 0
+                for ds in datasets:
+                    dataset_id = ds.get("dataset_id")
+                    table_id = ds.get("table_id")
+                    project_id = ds.get("project_id")
+                    
+                    # Skip if any identifier is None, empty, or the string "None"
+                    if (not dataset_id or dataset_id == "None" or 
+                        not table_id or table_id == "None" or
+                        not project_id or project_id == "None"):
+                        filtered_count += 1
+                        print(f"   ⚠️  Filtered out invalid dataset: {project_id}.{dataset_id}.{table_id}")
+                        continue
+                    
+                    valid_datasets.append(ds)
+                
+                datasets = valid_datasets
+                
+                if filtered_count > 0:
+                    print(f"   Filtered out {filtered_count} dataset(s) with invalid identifiers")
+                
+                print(f"✓ {len(datasets)} valid dataset(s) available for query generation")
+                
+                if not datasets:
+                    print("✗ No valid datasets after filtering")
+                    return []
                 
                 # Show summary
                 summary = metadata.get("summary", {})
@@ -279,6 +312,7 @@ class IntegratedMCPClient:
                     print(f"   Candidates found: {summary.get('total_candidates_found', 0)}")
                     print(f"   Execution time: {summary.get('total_execution_time_ms', 0):.0f}ms")
                 
+                print("\n📊 Valid Datasets:")
                 for i, ds in enumerate(datasets, 1):
                     print(f"   {i}. {ds['project_id']}.{ds['dataset_id']}.{ds['table_id']}")
                 print()
@@ -287,6 +321,160 @@ class IntegratedMCPClient:
             else:
                 print("✗ No datasets found")
                 return []
+    
+    async def extract_insights_from_prp(
+        self,
+        prp_text: str,
+        datasets: List[Dict[str, Any]],
+        max_insights: int = 3
+    ) -> List[str]:
+        """
+        Extract insights from PRP grounded in discovered datasets.
+        
+        Uses Gemini to analyze the PRP and discovered datasets, extracting
+        specific, actionable insights that reference real tables and columns.
+        
+        Args:
+            prp_text: Product Requirement Prompt markdown
+            datasets: Discovered datasets with schemas
+            max_insights: Maximum insights to extract (default: 3)
+            
+        Returns:
+            List of insight strings (questions that can be answered with SQL)
+        """
+        print(f"💡 Extracting insights from PRP...")
+        print(f"   Grounding in {len(datasets)} discovered dataset(s)")
+        print()
+        
+        # Build context about available datasets
+        dataset_context = []
+        for ds in datasets:
+            table_id = f"{ds['project_id']}.{ds['dataset_id']}.{ds['table_id']}"
+            row_count = ds.get('row_count', 'unknown')
+            
+            # Get schema info
+            schema_fields = ds.get('schema', [])
+            schema_summary = []
+            for field in schema_fields[:10]:  # Show first 10 fields
+                field_name = field.get('name', 'unknown')
+                field_type = field.get('type', 'unknown')
+                field_desc = field.get('description', '')
+                schema_summary.append(f"  - {field_name} ({field_type}): {field_desc[:50]}")
+            
+            dataset_context.append({
+                "table": table_id,
+                "rows": row_count,
+                "schema": "\n".join(schema_summary)
+            })
+        
+        # Build prompt for Gemini
+        dataset_context_text = "\n\n".join([
+            f"Table: {ds['table']}\nRows: {ds['rows']}\nColumns:\n{ds['schema']}"
+            for ds in dataset_context
+        ])
+        
+        prompt = f"""You are an expert data analyst. Extract {max_insights} specific, actionable data insights from the Product Requirement Prompt (PRP) that can be answered using the discovered datasets.
+
+PRODUCT REQUIREMENT PROMPT:
+{prp_text[:2000]}
+
+DISCOVERED DATASETS:
+{dataset_context_text}
+
+TASK:
+Extract {max_insights} insights that:
+1. **Reference actual column names** from the datasets above
+2. **Are specific and answerable** with SQL queries
+3. **Align with PRP objectives** (key metrics, comparisons, business questions)
+4. **Use realistic filters/groupings** based on available columns
+
+REQUIREMENTS:
+- Each insight MUST reference real table and column names shown above
+- Phrase as clear questions
+- Focus on metrics, aggregations, comparisons mentioned in PRP
+- Consider JOINs if multiple tables are relevant
+
+OUTPUT FORMAT (JSON):
+{{
+    "insights": [
+        "Insight 1 with specific table.column references",
+        "Insight 2 with specific table.column references",
+        "Insight 3 with specific table.column references"
+    ]
+}}
+
+Extract exactly {max_insights} insights now:"""
+        
+        # Use Gemini API to extract insights
+        api_key = os.getenv('GEMINI_API_KEY')
+        
+        if not api_key:
+            print("⚠️  GEMINI_API_KEY not set, using fallback insights")
+            return self._extract_insights_fallback(prp_text, datasets, max_insights)
+        
+        try:
+            genai.configure(api_key=api_key)
+            model = genai.GenerativeModel('gemini-2.0-flash-exp')
+            
+            response = model.generate_content(
+                prompt,
+                generation_config=genai.GenerationConfig(
+                    temperature=0.3,
+                    response_mime_type="application/json"
+                )
+            )
+            
+            result = json.loads(response.text)
+            insights = result.get("insights", [])
+            
+            print(f"✓ Extracted {len(insights)} insights:")
+            for i, insight in enumerate(insights, 1):
+                print(f"   {i}. {insight[:80]}...")
+            print()
+            
+            return insights[:max_insights]
+            
+        except Exception as e:
+            print(f"⚠️  Error extracting insights: {e}")
+            print("   Using fallback method...")
+            return self._extract_insights_fallback(prp_text, datasets, max_insights)
+    
+    def _extract_insights_fallback(
+        self,
+        prp_text: str,
+        datasets: List[Dict[str, Any]],
+        max_insights: int = 3
+    ) -> List[str]:
+        """
+        Fallback method: Extract simple insights using keyword matching.
+        
+        Args:
+            prp_text: PRP text
+            datasets: Discovered datasets
+            max_insights: Max insights to extract
+            
+        Returns:
+            List of basic insights
+        """
+        # Simple fallback: Look for question words and metrics in PRP
+        insights = []
+        
+        # Get first table for reference
+        if datasets:
+            ds = datasets[0]
+            table_id = f"{ds['project_id']}.{ds['dataset_id']}.{ds['table_id']}"
+            
+            # Extract some common patterns
+            if "average" in prp_text.lower() or "mean" in prp_text.lower():
+                insights.append(f"What are the average values in {table_id}?")
+            
+            if "top" in prp_text.lower() or "highest" in prp_text.lower():
+                insights.append(f"What are the top records by value in {table_id}?")
+            
+            if "compare" in prp_text.lower() or "comparison" in prp_text.lower():
+                insights.append(f"How do different categories compare in {table_id}?")
+        
+        return insights[:max_insights]
     
     async def discover_datasets(
         self,
@@ -344,7 +532,38 @@ class IntegratedMCPClient:
                 data = json.loads(result_text)
                 datasets = data.get("datasets", [])
                 
-                print(f"✓ Found {len(datasets)} datasets")
+                print(f"✓ Found {len(datasets)} dataset candidates from discovery")
+                
+                # Filter out datasets with invalid identifiers
+                valid_datasets = []
+                filtered_count = 0
+                for ds in datasets:
+                    dataset_id = ds.get("dataset_id")
+                    table_id = ds.get("table_id")
+                    project_id = ds.get("project_id")
+                    
+                    # Skip if any identifier is None, empty, or the string "None"
+                    if (not dataset_id or dataset_id == "None" or 
+                        not table_id or table_id == "None" or
+                        not project_id or project_id == "None"):
+                        filtered_count += 1
+                        print(f"   ⚠️  Filtered out invalid dataset: {project_id}.{dataset_id}.{table_id}")
+                        continue
+                    
+                    valid_datasets.append(ds)
+                
+                datasets = valid_datasets
+                
+                if filtered_count > 0:
+                    print(f"   Filtered out {filtered_count} dataset(s) with invalid identifiers")
+                
+                print(f"✓ {len(datasets)} valid dataset(s) available")
+                
+                if not datasets:
+                    print("✗ No valid datasets after filtering")
+                    return []
+                
+                print("\n📊 Valid Datasets:")
                 for i, ds in enumerate(datasets, 1):
                     print(f"   {i}. {ds['project_id']}.{ds['dataset_id']}.{ds['table_id']}")
                     print(f"      Type: {ds['table_type']}, Rows: {ds.get('row_count', 'N/A')}, Columns: {ds.get('column_count', 'N/A')}")
@@ -396,7 +615,7 @@ class IntegratedMCPClient:
         }
         
         # Use a longer timeout client for the entire operation, but short timeouts for individual requests
-        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=10.0)) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=30.0)) as client:
             # 1. Try async endpoint first
             try:
                 response = await client.post(
@@ -745,9 +964,40 @@ def print_query_results(results: Dict[str, Any], output_dir: Path) -> None:
         print("   - Reviewing error messages for guidance")
 
 
+def print_all_query_results(
+    all_results: List[Dict[str, Any]], 
+    output_dir: Path
+) -> None:
+    """
+    Print query generation results for multiple insights.
+    
+    Args:
+        all_results: List of {insight, results} dicts
+        output_dir: Output directory
+    """
+    # Save combined results
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    combined_file = output_dir / f"all_query_results_{timestamp}.json"
+    combined_file.write_text(json.dumps(all_results, indent=2))
+    print(f"💾 Saved all results to: {combined_file}")
+    print()
+    
+    # Print each insight's results
+    for i, item in enumerate(all_results, 1):
+        print("=" * 100)
+        print(f"INSIGHT {i}/{len(all_results)}")
+        print("=" * 100)
+        print()
+        print(f"📋 Insight: {item['insight']}")
+        print()
+        
+        # Print queries for this insight
+        print_query_results(item['results'], output_dir)
+        print()
+
+
 async def main(
     initial_intent: Optional[str] = None,
-    insight: Optional[str] = None,
     max_results: int = 5,
     max_queries: int = 3,
     max_iterations: int = 10,
@@ -759,11 +1009,12 @@ async def main(
     """
     Run the integrated workflow example.
     
+    Insights are automatically extracted from the PRP based on discovered datasets.
+    
     Args:
         initial_intent: Initial business intent for planning
-        insight: Data science insight for query generation
         max_results: Maximum datasets to discover from PRP
-        max_queries: Maximum number of queries to generate
+        max_queries: Maximum number of queries to generate per insight
         max_iterations: Maximum refinement iterations per query
         max_planning_turns: Maximum Q&A turns in planning phase
         planning_url: Data planning agent URL
@@ -775,13 +1026,10 @@ async def main(
     print("=" * 100)
     print()
     
-    # Use defaults if not provided
+    # Use default if not provided
     if initial_intent is None:
         initial_intent = "We want to analyze customer transaction patterns to identify high-value customers"
         print(f"ℹ️  Using default intent: '{initial_intent}'")
-    if insight is None:
-        insight = "What are the top 10 customers by total transaction amount in the last 30 days?"
-        print(f"ℹ️  Using default insight: '{insight}'")
     
     print()
     
@@ -835,16 +1083,43 @@ async def main(
         print("No datasets found. Exiting.")
         return
     
-    # Step 3: Generate queries
-    results = await client.generate_queries(
-        insight=insight,
+    # Step 3: Extract insights from PRP + datasets
+    print("💡 Extracting insights from PRP grounded in discovered datasets...")
+    insights = await client.extract_insights_from_prp(
+        prp_text=prp_text,
         datasets=datasets,
-        max_queries=max_queries,
-        max_iterations=max_iterations
+        max_insights=3
     )
     
-    # Step 4: Display results
-    print_query_results(results, client.output_dir)
+    if not insights:
+        print("✗ No insights extracted. Exiting.")
+        return
+    
+    # Step 4: Generate queries for each insight
+    all_results = []
+    
+    for i, current_insight in enumerate(insights, 1):
+        print("=" * 100)
+        print(f"GENERATING QUERIES FOR INSIGHT {i}/{len(insights)}")
+        print("=" * 100)
+        print()
+        
+        results = await client.generate_queries(
+            insight=current_insight,
+            datasets=datasets,
+            max_queries=max_queries,
+            max_iterations=max_iterations
+        )
+        
+        all_results.append({
+            "insight": current_insight,
+            "results": results
+        })
+        
+        print()
+    
+    # Step 5: Display all results
+    print_all_query_results(all_results, client.output_dir)
 
 
 def parse_args() -> argparse.Namespace:
@@ -859,13 +1134,12 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Use defaults (interactive Q&A)
+  # Use defaults (interactive Q&A, auto-extract insights)
   python integrated_workflow_example.py
   
-  # Custom initial intent and insight
+  # Custom initial intent (insights auto-extracted from PRP)
   python integrated_workflow_example.py \\
-    --initial-intent "Analyze customer behavior patterns" \\
-    --query-insight "What are the top customer segments by revenue?"
+    --initial-intent "Analyze customer behavior patterns"
   
   # Control planning and query generation
   python integrated_workflow_example.py \\
@@ -882,13 +1156,6 @@ Examples:
         "-i", "--initial-intent",
         type=str,
         help="Initial business intent for planning (e.g., 'Analyze customer behavior')"
-    )
-    
-    # Query generation parameters
-    parser.add_argument(
-        "-q", "--query-insight",
-        type=str,
-        help="Data science insight for query generation (e.g., 'Top 10 customers by revenue')"
     )
     
     # Planning configuration
@@ -948,11 +1215,14 @@ Examples:
 
 
 if __name__ == "__main__":
+    # Load environment variables
+    load_dotenv()
+    
     # Parse command-line arguments
     args = parse_args()
     
     print()
-    if args.initial_intent or args.query_insight:
+    if args.initial_intent:
         print("Running with custom parameters...")
     else:
         print("Running with default parameters...")
@@ -962,7 +1232,6 @@ if __name__ == "__main__":
     # Run main workflow
     asyncio.run(main(
         initial_intent=args.initial_intent,
-        insight=args.query_insight,
         max_results=args.max_results,
         max_queries=args.max_queries,
         max_iterations=args.max_iterations,

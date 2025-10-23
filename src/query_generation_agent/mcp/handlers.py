@@ -20,7 +20,6 @@ from ..models.request_models import DatasetMetadata, GenerateQueriesRequest
 from ..models.response_models import GenerateQueriesResponse
 from ..validation.alignment_validator import AlignmentValidator
 from ..validation.dryrun_validator import DryRunValidator
-from ..validation.syntax_validator import SyntaxValidator
 from .config import QueryGenerationConfig
 
 logger = logging.getLogger(__name__)
@@ -52,7 +51,6 @@ class MCPHandlers:
         self.gemini_client = gemini_client
         
         # Initialize validators
-        self.syntax_validator = SyntaxValidator()
         self.dryrun_validator = DryRunValidator(
             bigquery_client=bigquery_client,
             max_sample_rows=config.max_sample_rows
@@ -66,7 +64,6 @@ class MCPHandlers:
         self.query_ideator = QueryIdeator(gemini_client=gemini_client)
         self.query_refiner = QueryRefiner(
             gemini_client=gemini_client,
-            syntax_validator=self.syntax_validator,
             dryrun_validator=self.dryrun_validator,
             alignment_validator=self.alignment_validator,
             max_iterations=config.max_query_iterations
