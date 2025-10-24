@@ -4,6 +4,7 @@ Entry point for running the MCP server via python -m query_generation_agent.mcp
 Routes to either HTTP or stdio transport based on MCP_TRANSPORT environment variable.
 """
 
+import logging
 from .config import load_config
 
 
@@ -14,6 +15,9 @@ def run_server() -> None:
     Routes to either HTTP or stdio transport based on configuration.
     """
     config = load_config()
+    
+    # Apply logging level from configuration
+    logging.getLogger().setLevel(config.log_level)
     
     if config.mcp_transport.lower() == "http":
         # Run HTTP server

@@ -9,7 +9,7 @@ from typing import Any, Dict, List
 
 def format_schema_fields(schema_fields: List[Dict[str, Any]]) -> str:
     """
-    Format schema fields for prompts.
+    Format schema fields for prompts (legacy function for backwards compatibility).
     
     Args:
         schema_fields: List of field dictionaries
@@ -34,9 +34,72 @@ def format_schema_fields(schema_fields: List[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def format_enhanced_schema(schema_fields: List[Dict[str, Any]]) -> str:
+    """
+    Format schema with sample values for richer prompts.
+    
+    Args:
+        schema_fields: List of field dictionaries with sample_values
+        
+    Returns:
+        Formatted schema string with samples
+    """
+    if not schema_fields:
+        return "  (schema not available)"
+    
+    lines = []
+    for field in schema_fields:
+        name = field.get("name", "unknown")
+        ftype = field.get("type", "unknown")
+        desc = field.get("description", "")
+        samples = field.get("sample_values", [])
+        
+        line = f"  - {name} ({ftype})"
+        if desc:
+            line += f": {desc}"
+        if samples:
+            # Show first 3 sample values
+            sample_str = ", ".join(f'"{s}"' if isinstance(s, str) else str(s) for s in samples[:3])
+            line += f" [samples: {sample_str}]"
+        
+        lines.append(line)
+    
+    return "\n".join(lines)
+
+
+def format_column_statistics(profiles: List[Dict[str, Any]]) -> str:
+    """
+    Format column statistics for prompts.
+    
+    Args:
+        profiles: List of column profile dictionaries
+        
+    Returns:
+        Formatted column statistics string
+    """
+    if not profiles:
+        return "  (no statistics available)"
+    
+    lines = []
+    for profile in profiles[:10]:  # Limit to first 10 columns
+        col = profile.get("column_name")
+        ptype = profile.get("profile_type")
+        
+        if ptype == "numeric":
+            line = f"  - {col}: min={profile.get('min_value')}, max={profile.get('max_value')}, avg={profile.get('avg_value')}, distinct={profile.get('distinct_count')}"
+        elif ptype == "string":
+            line = f"  - {col}: distinct values={profile.get('distinct_count')}, length={profile.get('min_value')}-{profile.get('max_value')}"
+        else:
+            line = f"  - {col}: {profile.get('distinct_count')} distinct values"
+        
+        lines.append(line)
+    
+    return "\n".join(lines)
+
+
 def format_dataset_info(datasets: List[Dict[str, Any]], include_full_docs: bool = True) -> str:
     """
-    Format dataset information for prompts.
+    Format dataset information for prompts with rich metadata.
     
     Args:
         datasets: List of dataset metadata
@@ -48,21 +111,44 @@ def format_dataset_info(datasets: List[Dict[str, Any]], include_full_docs: bool 
     dataset_info = []
     for ds in datasets:
         table_id = f"{ds['project_id']}.{ds['dataset_id']}.{ds['table_id']}"
-        schema_text = format_schema_fields(ds.get("schema_fields", []))
         
+        # Use enhanced schema formatting if available, otherwise fall back to legacy
+        schema_fields = ds.get("schema", ds.get("schema_fields", []))
+        schema_text = format_enhanced_schema(schema_fields)
+        
+        # Build dataset info block
         info = f"""
 Table: `{table_id}`
+Description: {ds.get('description', 'No description')}
 Rows: {ds.get('row_count', 'unknown'):,}
+Type: {ds.get('asset_type', 'TABLE')}
+
 Schema:
 {schema_text}
 """
         
-        if include_full_docs and ds.get('full_markdown'):
-            # Include excerpt of documentation (first 500 chars)
-            doc_excerpt = ds['full_markdown'][:500]
+        # Add column statistics summary
+        if ds.get('column_profiles'):
+            stats = format_column_statistics(ds['column_profiles'])
             info += f"""
-Documentation excerpt:
-{doc_excerpt}...
+Column Statistics:
+{stats}
+"""
+        
+        # Add analytical insights examples
+        if ds.get('analytical_insights'):
+            insights = "\n".join(f"  - {insight}" for insight in ds['analytical_insights'][:3])
+            info += f"""
+Example Analytics Questions:
+{insights}
+"""
+        
+        # Add lineage info if available
+        if ds.get('lineage'):
+            sources = [l['source'] for l in ds['lineage'] if l.get('source')]
+            if sources:
+                info += f"""
+Data Sources: {', '.join(sources[:3])}
 """
         
         dataset_info.append(info)
@@ -87,15 +173,24 @@ INSIGHT:
 AVAILABLE DATASETS:
 {datasets}
 
+QUERY GENERATION GUIDELINES:
+1. USE THE SAMPLE VALUES: The schema includes sample values for each column - use these to understand data patterns and write appropriate filters
+2. LEVERAGE COLUMN STATISTICS: Min/max values and distinct counts help you write efficient WHERE clauses and understand data distributions
+3. LEARN FROM ANALYTICAL INSIGHTS: The example analytics questions show common use patterns for these tables
+4. CONSIDER DATA LINEAGE: Upstream sources indicate data freshness and quality
+5. USE APPROPRIATE AGGREGATIONS: For numeric columns with wide ranges, consider aggregations like AVG, SUM, COUNT
+6. FILTER WISELY: Use sample values to create realistic filter conditions
+7. GROUP STRATEGICALLY: Columns with low distinct counts (<100) are good candidates for GROUP BY
+
 REQUIREMENTS:
-1. Generate exactly {num_queries} distinct queries that answer the insight from different angles or with different approaches
+1. Generate exactly {num_queries} distinct queries that answer the insight from different angles
 2. Use only the tables and columns shown above
 3. Write valid BigQuery SQL (use backticks for table/column names with special chars)
-4. Include appropriate aggregations, filters, and GROUP BY clauses as needed
-5. Optimize for correctness and clarity over performance
-6. Each query should be self-contained and executable
-7. Include a brief description of what each query does
-8. Consider edge cases (NULL values, date ranges, data quality)
+4. Include appropriate aggregations, filters, and GROUP BY clauses
+5. Leverage sample values to create realistic examples
+6. Consider column statistics when choosing aggregation strategies
+7. Each query should be self-contained and executable
+8. Include a brief description of what each query does
 
 OUTPUT FORMAT (JSON):
 {{

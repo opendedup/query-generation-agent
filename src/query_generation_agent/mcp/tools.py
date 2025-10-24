@@ -11,6 +11,7 @@ from mcp.types import Tool
 
 # Tool names
 GENERATE_QUERIES_TOOL = "generate_queries"
+GENERATE_VIEWS_TOOL = "generate_views"
 
 
 def get_available_tools() -> list[Tool]:
@@ -270,6 +271,75 @@ def get_available_tools() -> list[Tool]:
                     }
                 },
                 "required": ["insight", "datasets"]
+            }
+        ),
+        Tool(
+            name=GENERATE_VIEWS_TOOL,
+            description=(
+                "Generate CREATE VIEW DDL statements from PRP data requirements (Section 9). "
+                "Parses target schemas from PRP markdown, generates SQL that transforms "
+                "source tables into required format. Returns validated DDL statements in "
+                "the same JSON format as generate_queries."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "prp_markdown": {
+                        "type": "string",
+                        "description": "PRP markdown containing Section 9: Data Requirements with table schemas",
+                        "minLength": 50
+                    },
+                    "source_datasets": {
+                        "type": "array",
+                        "description": (
+                            "Array of dataset metadata from data discovery in BigQuery writer schema format "
+                            "(DiscoveredAssetDict). Output from get_datasets_for_query_generation tool can be "
+                            "passed directly to this parameter."
+                        ),
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                # Core identifiers
+                                "table_id": {
+                                    "type": "string",
+                                    "description": "BigQuery table ID"
+                                },
+                                "project_id": {
+                                    "type": "string",
+                                    "description": "GCP project ID"
+                                },
+                                "dataset_id": {
+                                    "type": "string",
+                                    "description": "BigQuery dataset ID"
+                                },
+                                "asset_type": {
+                                    "type": "string",
+                                    "description": "Asset type (table, view, etc.)"
+                                },
+                                # Schema
+                                "schema": {
+                                    "type": "array",
+                                    "description": "Schema fields with names, types, modes, descriptions",
+                                    "items": {"type": "object"}
+                                },
+                                # Optional metadata
+                                "description": {"type": ["string", "null"]},
+                                "row_count": {"type": ["integer", "null"]},
+                                "column_count": {"type": ["integer", "null"]}
+                            },
+                            "required": ["table_id", "project_id", "dataset_id", "asset_type", "schema"]
+                        }
+                    },
+                    "target_project": {
+                        "type": "string",
+                        "description": "GCP project ID where views should be created (optional)"
+                    },
+                    "target_dataset": {
+                        "type": "string",
+                        "description": "BigQuery dataset where views should be created (optional)"
+                    }
+                },
+                "required": ["prp_markdown", "source_datasets"]
             }
         )
     ]

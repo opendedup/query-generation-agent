@@ -16,7 +16,7 @@ from ..clients.bigquery_client import BigQueryClient
 from ..clients.gemini_client import GeminiClient
 from .config import QueryGenerationConfig, load_config
 from .handlers import MCPHandlers
-from .tools import GENERATE_QUERIES_TOOL, get_available_tools
+from .tools import GENERATE_QUERIES_TOOL, GENERATE_VIEWS_TOOL, get_available_tools
 
 # Configure logging
 logging.basicConfig(
@@ -110,6 +110,9 @@ def create_mcp_server(config: QueryGenerationConfig | None = None) -> Server:
             # Route to appropriate handler
             if name == GENERATE_QUERIES_TOOL:
                 return await handlers.handle_generate_queries(arguments)
+            
+            elif name == GENERATE_VIEWS_TOOL:
+                return await handlers.handle_generate_views(arguments)
             
             else:
                 error_msg = f"Unknown tool: {name}"

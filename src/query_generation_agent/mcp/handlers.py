@@ -16,10 +16,13 @@ from ..clients.bigquery_client import BigQueryClient
 from ..clients.gemini_client import GeminiClient
 from ..generation.query_ideator import QueryIdeator
 from ..generation.query_refiner import QueryRefiner
-from ..models.request_models import DatasetMetadata, GenerateQueriesRequest
-from ..models.response_models import GenerateQueriesResponse
+from ..generation.view_generator import ViewGenerator
+from ..models.request_models import DatasetMetadata, GenerateQueriesRequest, GenerateViewsRequest
+from ..models.response_models import GenerateQueriesResponse, QueryResult
+from ..parsers.prp_parser import parse_prp_section_9
 from ..validation.alignment_validator import AlignmentValidator
 from ..validation.dryrun_validator import DryRunValidator
+from ..validation.view_validator import ViewValidator
 from .config import QueryGenerationConfig
 
 logger = logging.getLogger(__name__)
@@ -68,6 +71,10 @@ class MCPHandlers:
             alignment_validator=self.alignment_validator,
             max_iterations=config.max_query_iterations
         )
+        
+        # Initialize view generation components
+        self.view_generator = ViewGenerator(gemini_client=gemini_client)
+        self.view_validator = ViewValidator(bigquery_client=bigquery_client)
         
         logger.info("MCP handlers initialized")
     
@@ -191,7 +198,7 @@ class MCPHandlers:
     
     def _parse_request(self, arguments: Dict[str, Any]) -> GenerateQueriesRequest:
         """
-        Parse and validate request arguments.
+        Parse and validate request arguments from data-discovery-agent.
         
         Args:
             arguments: Raw request arguments
@@ -207,27 +214,31 @@ class MCPHandlers:
         datasets = []
         
         for ds_data in datasets_data:
-            # Map BigQuery schema format to DatasetMetadata format
-            # BigQuery format uses "schema" while DatasetMetadata uses "schema_fields"
-            if "schema" in ds_data and "schema_fields" not in ds_data:
-                ds_data["schema_fields"] = ds_data["schema"]
-            
-            # Map table_type to asset_type if asset_type is missing
-            if "table_type" in ds_data and "asset_type" not in ds_data:
-                ds_data["asset_type"] = ds_data["table_type"]
-            
-            # Set defaults for optional fields
-            ds_data.setdefault("row_count", None)
-            ds_data.setdefault("size_bytes", None)
-            ds_data.setdefault("column_count", None)
-            ds_data.setdefault("has_pii", False)
-            ds_data.setdefault("has_phi", False)
-            ds_data.setdefault("environment", None)
-            ds_data.setdefault("owner_email", None)
-            ds_data.setdefault("tags", [])
-            ds_data.setdefault("full_markdown", "")
-            
-            dataset = DatasetMetadata(**ds_data)
+            # Map data-discovery-agent output to our DatasetMetadata model
+            dataset = DatasetMetadata(
+                project_id=ds_data.get("project_id"),
+                dataset_id=ds_data.get("dataset_id"),
+                table_id=ds_data.get("table_id"),
+                asset_type=ds_data.get("asset_type", ds_data.get("table_type", "TABLE")),
+                description=ds_data.get("description"),
+                row_count=ds_data.get("row_count"),
+                size_bytes=ds_data.get("size_bytes"),
+                column_count=ds_data.get("column_count"),
+                created=ds_data.get("created"),
+                last_modified=ds_data.get("last_modified"),
+                insert_timestamp=ds_data.get("insert_timestamp"),
+                schema=ds_data.get("schema", []),
+                column_profiles=ds_data.get("column_profiles", []),
+                lineage=ds_data.get("lineage", []),
+                analytical_insights=ds_data.get("analytical_insights", []),
+                key_metrics=ds_data.get("key_metrics", []),
+                full_markdown=ds_data.get("full_markdown", ""),
+                has_pii=ds_data.get("has_pii", False),
+                has_phi=ds_data.get("has_phi", False),
+                environment=ds_data.get("environment"),
+                owner_email=ds_data.get("owner_email"),
+                tags=ds_data.get("tags", [])
+            )
             datasets.append(dataset)
         
         # Build request
@@ -283,4 +294,221 @@ class MCPHandlers:
                 TaskStatus.FAILED,
                 error=str(e)
             )
+    
+    async def handle_generate_views(self, arguments: Dict[str, Any]) -> Sequence[TextContent]:
+        """
+        Handle generate_views tool request.
+        
+        Generates CREATE VIEW DDL statements from PRP Section 9 data requirements.
+        
+        Args:
+            arguments: Tool arguments with prp_markdown and source_datasets
+            
+        Returns:
+            Sequence of TextContent with results in GenerateQueriesResponse format
+        """
+        start_time = time.time()
+        
+        try:
+            # Parse and validate request
+            request = self._parse_views_request(arguments)
+            
+            logger.info("Generating VIEW DDL from PRP Section 9")
+            logger.info(f"Source datasets: {len(request.source_datasets)}")
+            logger.info(f"Target location: {request.get_target_location() or 'not specified'}")
+            
+            # Parse PRP to extract target views
+            target_views = parse_prp_section_9(request.prp_markdown)
+            
+            if not target_views:
+                logger.error("No target views found in PRP markdown")
+                error_response = GenerateQueriesResponse(
+                    queries=[],
+                    total_attempted=0,
+                    total_validated=0,
+                    execution_time_ms=0,
+                    insight="Generate views from PRP Section 9",
+                    dataset_count=len(request.source_datasets),
+                    warnings=["No target views found in PRP Section 9"]
+                )
+                return [TextContent(type="text", text=json.dumps(error_response.model_dump(), indent=2))]
+            
+            logger.info(f"Found {len(target_views)} target views in PRP")
+            
+            # Generate DDL for each view
+            view_results = []
+            for target_view in target_views:
+                view_start_time = time.time()
+                
+                logger.info(f"Generating DDL for view: {target_view.view_name}")
+                
+                # Generate DDL (run in thread pool to avoid blocking)
+                success, error_msg, ddl = await asyncio.to_thread(
+                    self.view_generator.generate_view_ddl,
+                    target_view=target_view,
+                    source_datasets=request.source_datasets,
+                    target_location=request.get_target_location()
+                )
+                
+                if not success:
+                    logger.error(f"Failed to generate DDL for {target_view.view_name}: {error_msg}")
+                    # Create failed result
+                    from ..models.response_models import ValidationResult
+                    validation = ValidationResult(
+                        is_valid=False,
+                        error_message=error_msg,
+                        error_type="generation",
+                        syntax_valid=False,
+                        dryrun_valid=False,
+                        execution_valid=False,
+                        alignment_valid=False
+                    )
+                    
+                    result = QueryResult(
+                        sql="-- Failed to generate DDL",
+                        description=target_view.description,
+                        source_tables=[],
+                        validation_status="failed",
+                        validation_details=validation,
+                        alignment_score=0.0,
+                        iterations=0,
+                        generation_time_ms=(time.time() - view_start_time) * 1000
+                    )
+                    view_results.append(result)
+                    continue
+                
+                # Validate schema matches target (run in thread pool)
+                validation = await asyncio.to_thread(
+                    self.view_validator.validate_view_ddl,
+                    view_ddl=ddl,
+                    target_schema=target_view.columns
+                )
+                
+                # Extract source tables from DDL
+                source_tables = self._extract_source_tables_from_ddl(ddl)
+                
+                # Build QueryResult (same format as generate_queries)
+                result = QueryResult(
+                    sql=ddl,
+                    description=target_view.description,
+                    source_tables=source_tables,
+                    validation_status="valid" if validation.is_valid else "failed",
+                    validation_details=validation,
+                    alignment_score=validation.alignment_score or (1.0 if validation.is_valid else 0.0),
+                    iterations=0,  # No iterative refinement for views yet
+                    generation_time_ms=(time.time() - view_start_time) * 1000
+                )
+                
+                view_results.append(result)
+                logger.info(
+                    f"View {target_view.view_name}: "
+                    f"{result.validation_status} "
+                    f"({result.generation_time_ms:.0f}ms)"
+                )
+            
+            # Build response in GenerateQueriesResponse format
+            total_time = (time.time() - start_time) * 1000
+            response = GenerateQueriesResponse(
+                queries=view_results,
+                total_attempted=len(target_views),
+                total_validated=len([r for r in view_results if r.validation_status == "valid"]),
+                execution_time_ms=total_time,
+                insight="Generate views from PRP Section 9",
+                dataset_count=len(request.source_datasets)
+            )
+            
+            logger.info(
+                f"Generated {len(view_results)} views "
+                f"({response.total_validated} valid) in {total_time:.0f}ms"
+            )
+            
+            return [TextContent(type="text", text=json.dumps(response.model_dump(), indent=2))]
+            
+        except Exception as e:
+            logger.error(f"Error generating views: {e}", exc_info=True)
+            error_response = GenerateQueriesResponse(
+                queries=[],
+                total_attempted=0,
+                total_validated=0,
+                execution_time_ms=(time.time() - start_time) * 1000,
+                insight="Generate views from PRP Section 9",
+                dataset_count=0,
+                warnings=[f"Error: {str(e)}"]
+            )
+            return [TextContent(type="text", text=json.dumps(error_response.model_dump(), indent=2))]
+    
+    def _parse_views_request(self, arguments: Dict[str, Any]) -> GenerateViewsRequest:
+        """
+        Parse and validate generate_views request arguments.
+        
+        Args:
+            arguments: Raw request arguments
+            
+        Returns:
+            Validated GenerateViewsRequest
+            
+        Raises:
+            ValueError: If arguments are invalid
+        """
+        # Parse datasets
+        datasets_data = arguments.get("source_datasets", [])
+        datasets = []
+        
+        for ds_data in datasets_data:
+            # Map data-discovery-agent output to our DatasetMetadata model
+            dataset = DatasetMetadata(
+                project_id=ds_data.get("project_id"),
+                dataset_id=ds_data.get("dataset_id"),
+                table_id=ds_data.get("table_id"),
+                asset_type=ds_data.get("asset_type", ds_data.get("table_type", "TABLE")),
+                description=ds_data.get("description"),
+                row_count=ds_data.get("row_count"),
+                size_bytes=ds_data.get("size_bytes"),
+                column_count=ds_data.get("column_count"),
+                created=ds_data.get("created"),
+                last_modified=ds_data.get("last_modified"),
+                insert_timestamp=ds_data.get("insert_timestamp"),
+                schema=ds_data.get("schema", []),
+                column_profiles=ds_data.get("column_profiles", []),
+                lineage=ds_data.get("lineage", []),
+                analytical_insights=ds_data.get("analytical_insights", []),
+                key_metrics=ds_data.get("key_metrics", []),
+                full_markdown=ds_data.get("full_markdown", ""),
+                has_pii=ds_data.get("has_pii", False),
+                has_phi=ds_data.get("has_phi", False),
+                environment=ds_data.get("environment"),
+                owner_email=ds_data.get("owner_email"),
+                tags=ds_data.get("tags", [])
+            )
+            datasets.append(dataset)
+        
+        # Build request
+        request = GenerateViewsRequest(
+            prp_markdown=arguments["prp_markdown"],
+            source_datasets=datasets,
+            target_project=arguments.get("target_project"),
+            target_dataset=arguments.get("target_dataset")
+        )
+        
+        return request
+    
+    def _extract_source_tables_from_ddl(self, ddl: str) -> list[str]:
+        """
+        Extract source table references from DDL.
+        
+        Args:
+            ddl: SQL DDL statement
+            
+        Returns:
+            List of fully qualified table names
+        """
+        import re
+        
+        # Pattern to match fully qualified table names: `project.dataset.table` or project.dataset.table
+        pattern = r'`?([a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+)`?'
+        
+        matches = re.findall(pattern, ddl)
+        
+        # Deduplicate and return
+        return list(set(matches))
 

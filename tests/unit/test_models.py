@@ -117,6 +117,7 @@ def test_query_result() -> None:
     query = QueryResult(
         sql="SELECT * FROM table",
         description="Select all rows",
+        source_tables=["project.dataset.table"],
         validation_status="valid",
         validation_details=validation,
         alignment_score=0.92,
@@ -127,6 +128,7 @@ def test_query_result() -> None:
     
     assert query.is_valid() is True
     assert query.alignment_score == 0.92
+    assert query.source_tables == ["project.dataset.table"]
     
     summary = query.get_summary()
     assert "Status: valid" in summary
@@ -148,6 +150,7 @@ def test_generate_queries_response() -> None:
     query1 = QueryResult(
         sql="SELECT * FROM table1",
         description="Query 1",
+        source_tables=["project.dataset.table1"],
         validation_status="valid",
         validation_details=validation,
         alignment_score=0.92,
@@ -158,6 +161,7 @@ def test_generate_queries_response() -> None:
     query2 = QueryResult(
         sql="SELECT * FROM table2",
         description="Query 2",
+        source_tables=["project.dataset.table2"],
         validation_status="failed",
         validation_details=ValidationResult(
             is_valid=False,

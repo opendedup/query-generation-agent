@@ -82,6 +82,9 @@ class QueryRefiner:
         logger.info(f"Initial SQL:\n{initial_sql}")
         logger.info("=" * 80)
         
+        # Extract source tables from datasets
+        source_tables = [dataset.get_full_table_id() for dataset in datasets]
+        
         # Initialize validation history
         history = QueryValidationHistory(
             candidate_id=candidate_id,
@@ -163,7 +166,8 @@ class QueryRefiner:
             sql=history.final_sql or current_sql,
             description=description,
             history=history,
-            total_time_ms=total_time_ms
+            total_time_ms=total_time_ms,
+            source_tables=source_tables
         )
     
     def _run_validation_pipeline(
@@ -247,17 +251,19 @@ class QueryRefiner:
         validation_details["alignment_reasoning"] = reasoning
         
         if not aligned:
-            logger.warning(f"Alignment validation failed: score={score:.2f}, reasoning={reasoning}")
+            score_str = f"{score:.2f}" if score is not None else "N/A"
+            logger.warning(f"Alignment validation failed: score={score_str}, reasoning={reasoning}")
             iter_state.add_error(
                 stage=ValidationStage.ALIGNMENT,
                 error_type="alignment_error",
-                message=f"Query results don't align with insight (score: {score:.2f})",
+                message=f"Query results don't align with insight (score: {score_str})",
                 details={"reasoning": reasoning}
             )
             return False, score, validation_details
         
         # All validations passed!
-        logger.info(f"✓ Alignment validation passed (score={score:.2f})")
+        score_str = f"{score:.2f}" if score is not None else "N/A"
+        logger.info(f"✓ Alignment validation passed (score={score_str})")
         iter_state.current_stage = ValidationStage.COMPLETE
         return True, score, validation_details
     
@@ -266,7 +272,8 @@ class QueryRefiner:
         sql: str,
         description: str,
         history: QueryValidationHistory,
-        total_time_ms: float
+        total_time_ms: float,
+        source_tables: List[str]
     ) -> QueryResult:
         """
         Build final QueryResult from validation history.
@@ -276,6 +283,7 @@ class QueryRefiner:
             description: Query description
             history: Validation history
             total_time_ms: Total time spent
+            source_tables: Fully qualified table names used in query
             
         Returns:
             QueryResult object
@@ -303,6 +311,7 @@ class QueryRefiner:
         query_result = QueryResult(
             sql=sql,
             description=description,
+            source_tables=source_tables,
             validation_status="valid" if history.final_valid else "failed",
             validation_details=validation_result,
             alignment_score=history.final_alignment_score or 0.0,

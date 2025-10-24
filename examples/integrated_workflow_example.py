@@ -1,12 +1,12 @@
 """
-Integrated Workflow Example: Planning → Data Discovery → Query Generation
+Integrated Workflow Example: Planning → Discovery → Query Generation
 
 This example demonstrates the complete end-to-end workflow:
 1. Gather requirements using data-planning-agent with interactive Q&A
 2. Generate a structured Data Product Requirement Prompt (PRP)
-3. Discover datasets using data-discovery-agent based on the PRP
-4. Extract insights from PRP grounded in discovered datasets (up to 3)
-5. Generate SQL queries for each insight using query-generation-agent
+3. Extract Section 9 data requirements and discover source tables
+4. Generate SELECT queries for each target table specification
+5. Save query results as JSON files in output directory
 
 Prerequisites:
 - data-planning-agent running on http://localhost:8082 (not needed if using --prp-file)
@@ -15,7 +15,6 @@ Prerequisites:
 
 Usage:
     # Use default initial intent (interactive Q&A)
-    # Insights are automatically extracted from PRP
     python integrated_workflow_example.py
     
     # Specify custom initial intent
@@ -26,24 +25,23 @@ Usage:
     python integrated_workflow_example.py \
         --prp-file output/prp_20250101_120000.md
     
-    # Control planning turns and results
+    # Control query generation parameters
     python integrated_workflow_example.py \
-        --initial-intent "Track product performance" \
-        --max-planning-turns 5 \
-        --max-results 10 \
-        --max-queries 3
+        --max-queries 5 \
+        --max-iterations 15
 """
 
 import argparse
 import asyncio
 import json
 import os
+import re
+import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
-import google.generativeai as genai
 import httpx
 
 
@@ -77,679 +75,358 @@ class IntegratedMCPClient:
         # Create output directory if it doesn't exist
         self.output_dir.mkdir(exist_ok=True)
     
-    async def start_planning_session(
-        self,
-        initial_intent: str
-    ) -> tuple[str, str]:
+    def load_prp_from_file(self, prp_file: str) -> str:
         """
-        Start a planning session with initial business intent.
+        Load PRP content from a file.
         
         Args:
-            initial_intent: High-level business goal or intent
+            prp_file: Path to PRP markdown file
             
         Returns:
-            Tuple of (session_id, initial_questions)
-        """
-        request = {
-            "name": "start_planning_session",
-            "arguments": {
-                "initial_intent": initial_intent
-            }
-        }
-        
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.post(
-                f"{self.planning_url}/mcp/call-tool",
-                json=request
-            )
-            response.raise_for_status()
-            
-            result = response.json()
-            
-            # Extract session ID and questions from response
-            if "result" in result and len(result["result"]) > 0:
-                result_text = result["result"][0]["text"]
-                
-                # Parse session ID from response (format: **Session ID:** `{uuid}`)
-                import re
-                session_match = re.search(r'`([a-f0-9-]+)`', result_text)
-                if not session_match:
-                    raise ValueError("Could not extract session ID from response")
-                
-                session_id = session_match.group(1)
-                
-                # Extract questions (everything after the first --- and before the final ---)
-                parts = result_text.split("---")
-                if len(parts) >= 2:
-                    questions = parts[1].strip()
-                else:
-                    questions = result_text
-                
-                return (session_id, questions)
-            else:
-                raise ValueError("No response from planning agent")
-    
-    async def continue_planning_conversation(
-        self,
-        session_id: str,
-        user_response: str
-    ) -> tuple[str, bool]:
-        """
-        Continue a planning conversation with user response.
-        
-        Args:
-            session_id: Planning session ID
-            user_response: User's response to questions
-            
-        Returns:
-            Tuple of (next_questions, is_complete)
-        """
-        request = {
-            "name": "continue_conversation",
-            "arguments": {
-                "session_id": session_id,
-                "user_response": user_response
-            }
-        }
-        
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.post(
-                f"{self.planning_url}/mcp/call-tool",
-                json=request
-            )
-            response.raise_for_status()
-            
-            result = response.json()
-            
-            # Extract questions and completion status
-            if "result" in result and len(result["result"]) > 0:
-                result_text = result["result"][0]["text"]
-                
-                # Check if requirements are complete
-                is_complete = "requirements gathering complete" in result_text.lower() or \
-                              "Requirements gathering is complete" in result_text or \
-                              "requirements are complete" in result_text.lower()
-                
-                return (result_text, is_complete)
-            else:
-                raise ValueError("No response from planning agent")
-    
-    async def generate_prp(
-        self,
-        session_id: str
-    ) -> str:
-        """
-        Generate Data PRP from completed planning session.
-        
-        Args:
-            session_id: Planning session ID
-            
-        Returns:
-            Generated PRP text in markdown format
-        """
-        request = {
-            "name": "generate_data_prp",
-            "arguments": {
-                "session_id": session_id,
-                "save_to_file": False
-            }
-        }
-        
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.post(
-                f"{self.planning_url}/mcp/call-tool",
-                json=request
-            )
-            response.raise_for_status()
-            
-            result = response.json()
-            
-            # Extract PRP text from response
-            if "result" in result and len(result["result"]) > 0:
-                result_text = result["result"][0]["text"]
-                
-                # Extract markdown content between code fences if present
-                if "```markdown" in result_text:
-                    import re
-                    match = re.search(r'```markdown\n(.*?)\n```', result_text, re.DOTALL)
-                    if match:
-                        return match.group(1)
-                
-                # Otherwise return the full text
-                return result_text
-            else:
-                raise ValueError("No PRP generated from planning agent")
-    
-    def load_prp_from_file(self, prp_file_path: str) -> str:
-        """
-        Load PRP text from a markdown file.
-        
-        Args:
-            prp_file_path: Path to PRP markdown file
-            
-        Returns:
-            PRP text content
+            PRP content as string
             
         Raises:
             FileNotFoundError: If file doesn't exist
             ValueError: If file is empty
         """
-        prp_path = Path(prp_file_path)
-        
+        prp_path = Path(prp_file)
         if not prp_path.exists():
-            raise FileNotFoundError(f"PRP file not found: {prp_file_path}")
-        
-        if not prp_path.is_file():
-            raise ValueError(f"Path is not a file: {prp_file_path}")
+            raise FileNotFoundError(f"PRP file not found: {prp_file}")
         
         prp_text = prp_path.read_text()
-        
         if not prp_text.strip():
-            raise ValueError(f"PRP file is empty: {prp_file_path}")
+            raise ValueError(f"PRP file is empty: {prp_file}")
         
         return prp_text
-    
-    async def discover_datasets_from_prp(
+
+    def _extract_target_schema_from_prp(self, prp_text: str) -> List[Dict[str, Any]]:
+        """
+        Extract target view schemas from PRP Section 9.
+
+        Args:
+            prp_text: The full PRP markdown text.
+
+        Returns:
+            A list of target table specifications.
+        """
+        target_tables = []
+        
+        # Isolate Section 9 - handle both "9." and "## 9." formats
+        section_9_match = re.search(r"##?\s*9\.\s+Data\s+Requirements(.*?)(?=##?\s*\d+\.|$)", prp_text, re.DOTALL | re.IGNORECASE)
+        if not section_9_match:
+            print("DEBUG: Could not find Section 9 in PRP")
+            return []
+
+        section_9_content = section_9_match.group(1)
+        print(f"DEBUG: Found Section 9, length: {len(section_9_content)} characters")
+
+        # Find all target view blocks - look for View Name pattern
+        view_pattern = r'\*\*View\s+Name\*\*:\s*`([^`]+)`(.*?)(?=\*\*View\s+Name\*\*:|###|$)'
+        view_blocks = re.findall(view_pattern, section_9_content, re.DOTALL)
+        
+        print(f"DEBUG: Found {len(view_blocks)} view blocks")
+        
+        for view_name, view_content in view_blocks:
+            print(f"DEBUG: Processing view: {view_name}")
+            
+            # Extract purpose/description
+            description_match = re.search(r'-\s+\*\*Purpose\*\*:\s*([^\n]+)', view_content)
+            description = description_match.group(1).strip() if description_match else ""
+
+            # Extract schema section
+            schema_match = re.search(r'-\s+\*\*Schema\*\*:(.*?)(?=-\s+\*\*|$)', view_content, re.DOTALL)
+            if not schema_match:
+                print(f"DEBUG: No schema found for {view_name}")
+                continue
+                
+            schema_content = schema_match.group(1)
+            
+            columns = []
+            # Extract columns - format is "  - `column_name` (type): description"
+            column_matches = re.findall(r'\s+-\s+`([^`]+)`\s+\(([^)]+)\):\s*([^\n]+)', schema_content)
+            print(f"DEBUG: Found {len(column_matches)} columns for {view_name}")
+            
+            for col_name, col_type, col_desc in column_matches:
+                columns.append({
+                    "name": col_name.strip(),
+                    "type": col_type.strip(),
+                    "description": col_desc.strip()
+                })
+            
+            if columns:
+                target_tables.append({
+                    "target_table_name": view_name,
+                    "target_description": description,
+                    "target_columns": columns
+                })
+                print(f"DEBUG: Added target table: {view_name} with {len(columns)} columns")
+                
+        return target_tables
+
+    async def discover_source_tables_from_prp(
         self,
         prp_text: str,
-        max_results: int = 5
-    ) -> List[Dict[str, Any]]:
-        """
-        Discover datasets from PRP text.
-        
-        Args:
-            prp_text: Generated PRP markdown text
-            max_results: Maximum datasets to return
-            
-        Returns:
-            List of discovered datasets with metadata
-        """
-        print(f"🔍 Discovering datasets from PRP...")
-        print()
-        
-        request = {
-            "name": "discover_datasets_for_prp",
-            "arguments": {
-                "prp_text": prp_text,
-                "max_results": max_results
-            }
-        }
-        
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.post(
-                f"{self.discovery_url}/mcp/call-tool",
-                json=request
-            )
-            response.raise_for_status()
-            
-            result = response.json()
-            
-            # Extract datasets and metadata
-            if "result" in result and len(result["result"]) > 0:
-                result_text = result["result"][0]["text"]
-                data = json.loads(result_text)
-                
-                # Save discovery JSON to file
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                discovery_file = self.output_dir / f"discovery_results_{timestamp}.json"
-                discovery_file.write_text(json.dumps(data, indent=2))
-                print(f"💾 Saved discovery results to: {discovery_file}")
-                print()
-                
-                # Print the JSON response from data discovery agent
-                print("=" * 80)
-                print("DATA DISCOVERY AGENT JSON RESPONSE")
-                print("=" * 80)
-                print(json.dumps(data, indent=2))
-                print("=" * 80)
-                print()
-                
-                datasets = data.get("datasets", [])
-                metadata = data.get("discovery_metadata", {})
-                
-                print(f"✓ Found {len(datasets)} dataset candidates from discovery")
-                
-                # Filter out datasets with invalid identifiers
-                valid_datasets = []
-                filtered_count = 0
-                for ds in datasets:
-                    dataset_id = ds.get("dataset_id")
-                    table_id = ds.get("table_id")
-                    project_id = ds.get("project_id")
-                    
-                    # Skip if any identifier is None, empty, or the string "None"
-                    if (not dataset_id or dataset_id == "None" or 
-                        not table_id or table_id == "None" or
-                        not project_id or project_id == "None"):
-                        filtered_count += 1
-                        print(f"   ⚠️  Filtered out invalid dataset: {project_id}.{dataset_id}.{table_id}")
-                        continue
-                    
-                    valid_datasets.append(ds)
-                
-                datasets = valid_datasets
-                
-                if filtered_count > 0:
-                    print(f"   Filtered out {filtered_count} dataset(s) with invalid identifiers")
-                
-                print(f"✓ {len(datasets)} valid dataset(s) available for query generation")
-                
-                if not datasets:
-                    print("✗ No valid datasets after filtering")
-                    return []
-                
-                # Show summary
-                summary = metadata.get("summary", {})
-                if summary:
-                    print(f"   Queries executed: {summary.get('total_queries_generated', 0)}")
-                    print(f"   Candidates found: {summary.get('total_candidates_found', 0)}")
-                    print(f"   Execution time: {summary.get('total_execution_time_ms', 0):.0f}ms")
-                
-                print("\n📊 Valid Datasets:")
-                for i, ds in enumerate(datasets, 1):
-                    print(f"   {i}. {ds['project_id']}.{ds['dataset_id']}.{ds['table_id']}")
-                print()
-                
-                return datasets
-            else:
-                print("✗ No datasets found")
-                return []
-    
-    async def extract_insights_from_prp(
-        self,
-        prp_text: str,
-        datasets: List[Dict[str, Any]],
-        max_insights: int = 3
-    ) -> List[str]:
-        """
-        Extract insights from PRP grounded in discovered datasets.
-        
-        Uses Gemini to analyze the PRP and discovered datasets, extracting
-        specific, actionable insights that reference real tables and columns.
-        
-        Args:
-            prp_text: Product Requirement Prompt markdown
-            datasets: Discovered datasets with schemas
-            max_insights: Maximum insights to extract (default: 3)
-            
-        Returns:
-            List of insight strings (questions that can be answered with SQL)
-        """
-        print(f"💡 Extracting insights from PRP...")
-        print(f"   Grounding in {len(datasets)} discovered dataset(s)")
-        print()
-        
-        # Build context about available datasets
-        dataset_context = []
-        for ds in datasets:
-            table_id = f"{ds['project_id']}.{ds['dataset_id']}.{ds['table_id']}"
-            row_count = ds.get('row_count', 'unknown')
-            
-            # Get schema info
-            schema_fields = ds.get('schema', [])
-            schema_summary = []
-            for field in schema_fields[:10]:  # Show first 10 fields
-                field_name = field.get('name', 'unknown')
-                field_type = field.get('type', 'unknown')
-                field_desc = field.get('description', '')
-                schema_summary.append(f"  - {field_name} ({field_type}): {field_desc[:50]}")
-            
-            dataset_context.append({
-                "table": table_id,
-                "rows": row_count,
-                "schema": "\n".join(schema_summary)
-            })
-        
-        # Build prompt for Gemini
-        dataset_context_text = "\n\n".join([
-            f"Table: {ds['table']}\nRows: {ds['rows']}\nColumns:\n{ds['schema']}"
-            for ds in dataset_context
-        ])
-        
-        prompt = f"""You are an expert data analyst. Extract {max_insights} specific, actionable data insights from the Product Requirement Prompt (PRP) that can be answered using the discovered datasets.
-
-PRODUCT REQUIREMENT PROMPT:
-{prp_text[:2000]}
-
-DISCOVERED DATASETS:
-{dataset_context_text}
-
-TASK:
-Extract {max_insights} insights that:
-1. **Reference actual column names** from the datasets above
-2. **Are specific and answerable** with SQL queries
-3. **Align with PRP objectives** (key metrics, comparisons, business questions)
-4. **Use realistic filters/groupings** based on available columns
-
-REQUIREMENTS:
-- Each insight MUST reference real table and column names shown above
-- Phrase as clear questions
-- Focus on metrics, aggregations, comparisons mentioned in PRP
-- Consider JOINs if multiple tables are relevant
-
-OUTPUT FORMAT (JSON):
-{{
-    "insights": [
-        "Insight 1 with specific table.column references",
-        "Insight 2 with specific table.column references",
-        "Insight 3 with specific table.column references"
-    ]
-}}
-
-Extract exactly {max_insights} insights now:"""
-        
-        # Use Gemini API to extract insights
-        api_key = os.getenv('GEMINI_API_KEY')
-        
-        if not api_key:
-            print("⚠️  GEMINI_API_KEY not set, using fallback insights")
-            return self._extract_insights_fallback(prp_text, datasets, max_insights)
-        
-        try:
-            genai.configure(api_key=api_key)
-            model = genai.GenerativeModel('gemini-2.0-flash-exp')
-            
-            response = model.generate_content(
-                prompt,
-                generation_config=genai.GenerationConfig(
-                    temperature=0.3,
-                    response_mime_type="application/json"
-                )
-            )
-            
-            result = json.loads(response.text)
-            insights = result.get("insights", [])
-            
-            print(f"✓ Extracted {len(insights)} insights:")
-            for i, insight in enumerate(insights, 1):
-                print(f"   {i}. {insight[:80]}...")
-            print()
-            
-            return insights[:max_insights]
-            
-        except Exception as e:
-            print(f"⚠️  Error extracting insights: {e}")
-            print("   Using fallback method...")
-            return self._extract_insights_fallback(prp_text, datasets, max_insights)
-    
-    def _extract_insights_fallback(
-        self,
-        prp_text: str,
-        datasets: List[Dict[str, Any]],
-        max_insights: int = 3
-    ) -> List[str]:
-        """
-        Fallback method: Extract simple insights using keyword matching.
-        
-        Args:
-            prp_text: PRP text
-            datasets: Discovered datasets
-            max_insights: Max insights to extract
-            
-        Returns:
-            List of basic insights
-        """
-        # Simple fallback: Look for question words and metrics in PRP
-        insights = []
-        
-        # Get first table for reference
-        if datasets:
-            ds = datasets[0]
-            table_id = f"{ds['project_id']}.{ds['dataset_id']}.{ds['table_id']}"
-            
-            # Extract some common patterns
-            if "average" in prp_text.lower() or "mean" in prp_text.lower():
-                insights.append(f"What are the average values in {table_id}?")
-            
-            if "top" in prp_text.lower() or "highest" in prp_text.lower():
-                insights.append(f"What are the top records by value in {table_id}?")
-            
-            if "compare" in prp_text.lower() or "comparison" in prp_text.lower():
-                insights.append(f"How do different categories compare in {table_id}?")
-        
-        return insights[:max_insights]
-    
-    async def discover_datasets(
-        self,
-        query: str,
-        page_size: int = 5,
-        has_pii: Optional[bool] = None,
-        has_phi: Optional[bool] = None,
-        environment: Optional[str] = None
-    ) -> List[Dict[str, Any]]:
-        """
-        Discover datasets using natural language query.
-        
-        Args:
-            query: Natural language search query (e.g., "customer transaction tables")
-            page_size: Number of results to return
-            has_pii: Filter by PII data presence
-            has_phi: Filter by PHI data presence
-            environment: Filter by environment (prod, staging, dev)
-            
-        Returns:
-            List of discovered datasets in BigQuery schema format
-        """
-        print(f"🔍 Discovering datasets with query: '{query}'")
-        print(f"   Filters: page_size={page_size}, has_pii={has_pii}, has_phi={has_phi}, environment={environment}")
-        print()
-        
-        request = {
-            "name": "get_datasets_for_query_generation",
-            "arguments": {
-                "query": query,
-                "page_size": page_size
-            }
-        }
-        
-        # Add optional filters
-        if has_pii is not None:
-            request["arguments"]["has_pii"] = has_pii
-        if has_phi is not None:
-            request["arguments"]["has_phi"] = has_phi
-        if environment:
-            request["arguments"]["environment"] = environment
-        
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.post(
-                f"{self.discovery_url}/mcp/call-tool",
-                json=request
-            )
-            response.raise_for_status()
-            
-            result = response.json()
-            
-            # Extract datasets from response
-            if "result" in result and len(result["result"]) > 0:
-                result_text = result["result"][0]["text"]
-                data = json.loads(result_text)
-                datasets = data.get("datasets", [])
-                
-                print(f"✓ Found {len(datasets)} dataset candidates from discovery")
-                
-                # Filter out datasets with invalid identifiers
-                valid_datasets = []
-                filtered_count = 0
-                for ds in datasets:
-                    dataset_id = ds.get("dataset_id")
-                    table_id = ds.get("table_id")
-                    project_id = ds.get("project_id")
-                    
-                    # Skip if any identifier is None, empty, or the string "None"
-                    if (not dataset_id or dataset_id == "None" or 
-                        not table_id or table_id == "None" or
-                        not project_id or project_id == "None"):
-                        filtered_count += 1
-                        print(f"   ⚠️  Filtered out invalid dataset: {project_id}.{dataset_id}.{table_id}")
-                        continue
-                    
-                    valid_datasets.append(ds)
-                
-                datasets = valid_datasets
-                
-                if filtered_count > 0:
-                    print(f"   Filtered out {filtered_count} dataset(s) with invalid identifiers")
-                
-                print(f"✓ {len(datasets)} valid dataset(s) available")
-                
-                if not datasets:
-                    print("✗ No valid datasets after filtering")
-                    return []
-                
-                print("\n📊 Valid Datasets:")
-                for i, ds in enumerate(datasets, 1):
-                    print(f"   {i}. {ds['project_id']}.{ds['dataset_id']}.{ds['table_id']}")
-                    print(f"      Type: {ds['table_type']}, Rows: {ds.get('row_count', 'N/A')}, Columns: {ds.get('column_count', 'N/A')}")
-                print()
-                
-                return datasets
-            else:
-                print("✗ No datasets found")
-                return []
-    
-    async def generate_queries(
-        self,
-        insight: str,
-        datasets: List[Dict[str, Any]],
-        max_queries: int = 3,
-        max_iterations: int = 10,
-        poll_interval: int = 5
+        max_results_per_query: int = 5
     ) -> Dict[str, Any]:
         """
-        Generate SQL queries from insight and datasets using async pattern.
+        Discover source tables using the new strategy-driven discovery agent.
+
+        Args:
+            prp_text: Generated PRP markdown text
+            max_results_per_query: Maximum source tables per search query
+
+        Returns:
+            Discovery results structured for query generation.
+        """
+        print(f"📄 Extracting target schema from PRP Section 9...")
+        
+        target_schemas = self._extract_target_schema_from_prp(prp_text)
+        if not target_schemas:
+            print("✗ Error: Could not find any target view schemas in PRP Section 9.")
+            return {"target_tables": []}
+        
+        # For this workflow, we'll focus on the first target schema found.
+        target_schema = target_schemas[0]
+        print(f"✓ Extracted schema for target view: `{target_schema['target_table_name']}`")
+        print()
+        
+        print(f"🔍 Discovering source tables with new strategy-driven agent...")
+        
+        request = {
+            "name": "discover_from_prp",
+            "arguments": {
+                "prp_markdown": prp_text,
+                "target_schema": target_schema,
+                "max_results_per_query": max_results_per_query,
+            }
+        }
+        
+        # Debug: Print what we're sending
+        print(f"DEBUG: Sending request with tool: {request['name']}")
+        print(f"DEBUG: Arguments keys: {list(request['arguments'].keys())}")
+        print(f"DEBUG: target_schema present: {'target_schema' in request['arguments']}")
+        print(f"DEBUG: target_schema type: {type(request['arguments'].get('target_schema'))}")
+        if 'target_schema' in request['arguments']:
+            print(f"DEBUG: target_schema keys: {list(request['arguments']['target_schema'].keys())}")
+        print()
+        
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.post(
+                    f"{self.discovery_url}/mcp/call-tool",
+                    json=request
+                )
+                response.raise_for_status()
+                
+                result = response.json()
+                
+                if "result" in result and len(result["result"]) > 0:
+                    result_text = result["result"][0]["text"]
+                    
+                    if not result_text or not result_text.strip():
+                        print("✗ Error: Empty response from discovery tool")
+                        return {"target_tables": []}
+                    
+                    try:
+                        # Check for actual MCP error format (starts with "# Error:")
+                        if result_text.strip().startswith("# Error:"):
+                             print("✗ Error received from discovery tool:")
+                             print("--- SERVER RESPONSE ---")
+                             print(result_text)
+                             print("-----------------------")
+                             return {"target_tables": []}
+                        
+                        data = json.loads(result_text)
+                    except json.JSONDecodeError:
+                        print(f"✗ Error: Invalid JSON response from discovery tool.")
+                        print("--- SERVER RESPONSE ---")
+                        print(result_text)
+                        print("-----------------------")
+                        return {"target_tables": []}
+
+                    # Save the raw discovery results for debugging
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    discovery_file = self.output_dir / f"prp_discovery_{timestamp}.json"
+                    discovery_file.write_text(json.dumps(data, indent=2))
+                    print(f"💾 Saved raw discovery results to: {discovery_file}")
+                    print()
+
+                    # Adapt the new response format to the one expected by the rest of this script
+                    all_discovered_tables = []
+                    if "search_plan_results" in data:
+                        for step in data["search_plan_results"]:
+                            all_discovered_tables.extend(step.get("discovered_tables", []))
+                    
+                    # Deduplicate tables based on table_id
+                    unique_tables = {tbl['table_id']: tbl for tbl in all_discovered_tables}.values()
+
+                    # Reconstruct the "target_tables" structure for the query generator
+                    adapted_result = {
+                        "target_tables": [
+                            {
+                                **target_schema,
+                                "discovered_tables": list(unique_tables)
+                            }
+                        ],
+                        "total_targets": 1,
+                        "total_discovered": len(unique_tables)
+                    }
+
+                    print(f"✓ Discovery complete across {data.get('total_steps', 0)} search step(s)")
+                    print(f"✓ Found {len(unique_tables)} unique source table(s) for `{target_schema['target_table_name']}`")
+                    print()
+                    
+                    return adapted_result
+                else:
+                    print("✗ No 'result' key in discovery response body.")
+                    print(f"Full response: {result}")
+                    return {"target_tables": []}
+
+        except httpx.HTTPStatusError as e:
+            print(f"✗ HTTP Error: Received status code {e.response.status_code} from discovery agent.")
+            print("--- FULL SERVER TRACEBACK ---")
+            print(e.response.text)
+            print("-----------------------------")
+            return {"target_tables": []}
+        except Exception:
+            print(f"✗ An unexpected error occurred in the client.")
+            print("--- FULL CLIENT TRACEBACK ---")
+            traceback.print_exc()
+            print("-----------------------------")
+            return {"target_tables": []}
+
+    async def handle_user_confirmation(self, gap_details: Dict[str, Any]) -> Optional[Dict[str, str]]:
+        """
+        Prompt the user to resolve a data gap.
         
         Args:
-            insight: Data science insight or question to answer
-            datasets: List of datasets from discovery (in BigQuery schema format)
-            max_queries: Maximum number of queries to generate
-            max_iterations: Maximum refinement iterations per query
-            poll_interval: Seconds between status checks (default: 5)
+            gap_details: The details of the data gap from the agent.
             
         Returns:
-            Query generation results with validated SQL queries
+            A dictionary with the resolved gap, or None if the user skips.
         """
-        print(f"🤖 Generating queries for insight:")
-        print(f"   '{insight}'")
+        print("=" * 80)
+        print("ACTION REQUIRED: Please Resolve a Data Gap")
+        print("=" * 80)
+        print(f"\nThe agent could not automatically find a data source for the target view:")
+        print(f"  Target View: {gap_details['target_view']}")
+        print(f"  Data Gap: {gap_details['gap_description']}")
+        print("\nPlease select one of the following candidate tables to resolve this gap:")
+        
+        candidates = gap_details["candidate_tables"]
+        for i, table in enumerate(candidates):
+            print(f"  {i + 1}. {table}")
+        
+        print(f"  {len(candidates) + 1}. Skip this table and continue")
+        print("-" * 80)
+        
+        while True:
+            try:
+                selection = input("Enter your choice (number): ")
+                choice = int(selection)
+                if 1 <= choice <= len(candidates):
+                    selected_table = candidates[choice - 1]
+                    print(f"You selected: {selected_table}")
+                    return {gap_details["gap_id"]: selected_table}
+                elif choice == len(candidates) + 1:
+                    print("You chose to skip. The agent will proceed without this target view.")
+                    return None
+                else:
+                    print("Invalid choice. Please enter a number from the list.")
+            except ValueError:
+                print("Invalid input. Please enter a number.")
+    
+    async def generate_queries_for_target(
+        self,
+        target_table_name: str,
+        target_description: str,
+        target_columns: List[Dict[str, Any]],
+        source_datasets: List[Dict[str, Any]],
+        max_queries: int = 3,
+        max_iterations: int = 10
+    ) -> Dict[str, Any]:
+        """
+        Generate SELECT queries for a target table specification.
+        
+        Args:
+            target_table_name: Name of target table
+            target_description: Description of target table
+            target_columns: Target column specifications
+            source_datasets: Discovered source tables
+            max_queries: Maximum number of queries to generate
+            max_iterations: Maximum refinement iterations
+            
+        Returns:
+            Query generation results
+        """
+        print(f"🤖 Generating queries for: {target_table_name}")
+        print(f"   Using {len(source_datasets)} source table(s)")
         print()
-        print(f"   Using {len(datasets)} dataset(s)")
-        print(f"   Max queries: {max_queries}, Max iterations: {max_iterations}")
-        print()
-        print("   This may take 1-2 minutes (generating, validating, and refining)...")
-        print()
+        
+        # Build insight from target specification
+        column_list = ", ".join([col['name'] for col in target_columns[:10]])
+        if len(target_columns) > 10:
+            column_list += f", ... ({len(target_columns)} total columns)"
+        
+        insight = f"Generate a query that returns data for {target_table_name}: {target_description}. Required columns: {column_list}"
         
         request = {
             "name": "generate_queries",
             "arguments": {
                 "insight": insight,
-                "datasets": datasets,
+                "datasets": source_datasets,
                 "max_queries": max_queries,
                 "max_iterations": max_iterations
             }
         }
         
-        # Use a longer timeout client for the entire operation, but short timeouts for individual requests
-        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=30.0)) as client:
-            # 1. Try async endpoint first
-            try:
-                response = await client.post(
-                    f"{self.query_gen_url}/mcp/call-tool-async",
-                    json=request,
-                    timeout=30.0  # Give more time for task creation
-                )
-                
-                if response.status_code == 202:
-                    # Async endpoint available - use polling pattern
-                    task_data = response.json()
-                    task_id = task_data["task_id"]
-                    status_url = f"{self.query_gen_url}{task_data['status_url']}"
-                    
-                    print(f"   Task ID: {task_id}")
-                    print(f"   Polling for status every {poll_interval}s...")
-                    print()
-                    
-                    # 2. Poll for completion
-                    start_time = asyncio.get_event_loop().time()
-                    
-                    while True:
-                        elapsed = asyncio.get_event_loop().time() - start_time
-                        
-                        if elapsed > self.timeout:
-                            raise TimeoutError(f"Task did not complete within {self.timeout}s")
-                        
-                        await asyncio.sleep(poll_interval)
-                        
-                        # Retry logic for status checks (server might be slow under load)
-                        max_retries = 3
-                        status_data = None
-                        
-                        for attempt in range(max_retries):
-                            try:
-                                # Increased timeout for status checks
-                                status_response = await client.get(status_url, timeout=30.0)
-                                status_data = status_response.json()
-                                break
-                            except httpx.ReadTimeout:
-                                if attempt < max_retries - 1:
-                                    print(f"   ⚠️  Status check timed out, retrying... ({attempt + 1}/{max_retries})")
-                                    await asyncio.sleep(2)
-                                else:
-                                    print(f"   ✗ Status check failed after {max_retries} attempts")
-                                    raise
-                        
-                        if status_data is None:
-                            raise Exception("Failed to get status after retries")
-                        
-                        status = status_data["status"]
-                        print(f"   Status: {status} ({elapsed:.0f}s elapsed)")
-                        
-                        if status == "completed":
-                            # 3. Retrieve result
-                            result_url = f"{self.query_gen_url}{status_data['result_url']}"
-                            
-                            # Also retry result retrieval
-                            for attempt in range(max_retries):
-                                try:
-                                    result_response = await client.get(result_url, timeout=60.0)
-                                    result_json = result_response.json()
-                                    break
-                                except httpx.ReadTimeout:
-                                    if attempt < max_retries - 1:
-                                        print(f"   ⚠️  Result retrieval timed out, retrying... ({attempt + 1}/{max_retries})")
-                                        await asyncio.sleep(2)
-                                    else:
-                                        raise
-                            
-                            print()
-                            print("✓ Query generation complete")
-                            print()
-                            
-                            return result_json["result"]
-                        
-                        elif status == "failed":
-                            error = status_data.get("error", "Unknown error")
-                            raise Exception(f"Task failed: {error}")
-                
-                # If not 202, fall through to sync endpoint
-            except httpx.HTTPStatusError as e:
-                if e.response.status_code != 404:
-                    raise
-                # 404 means async endpoint doesn't exist, fall back to sync
-            
-            # Fallback to sync endpoint
-            print("   ℹ️  Using synchronous endpoint (async not available)")
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
             response = await client.post(
                 f"{self.query_gen_url}/mcp/call-tool",
-                json=request,
-                timeout=self.timeout
+                json=request
             )
             response.raise_for_status()
             
             result = response.json()
             
-            print("✓ Query generation complete")
-            print()
+            # Handle two response formats:
+            # 1. MCP protocol wrapped: {"result": {"content": [{"text": "..."}]}}
+            # 2. Direct JSON: {"queries": [...], "total_attempted": ...}
             
-            return result
+            # Check if it's MCP protocol wrapped
+            if "result" in result and "content" in result["result"]:
+                content_list = result["result"]["content"]
+                if len(content_list) > 0 and "text" in content_list[0]:
+                    result_text = content_list[0]["text"]
+                    try:
+                        return json.loads(result_text)
+                    except json.JSONDecodeError as e:
+                        print(f"✗ Error parsing MCP wrapped response: {e}")
+                        print(f"Response text: {result_text[:500]}")
+                        return {
+                            "queries": [],
+                            "total_attempted": 0,
+                            "total_validated": 0,
+                            "execution_time_ms": 0,
+                            "warnings": ["JSON parse error"]
+                        }
+            
+            # Check if it's direct JSON format (already unwrapped)
+            elif "queries" in result:
+                return result
+            
+            # Unknown format
+            else:
+                print(f"✗ Unexpected response structure from query generation agent")
+                print(f"Response keys: {list(result.keys())}")
+                print(f"Full response: {json.dumps(result, indent=2)[:500]}")
+                return {
+                    "queries": [],
+                    "total_attempted": 0,
+                    "total_validated": 0,
+                    "execution_time_ms": 0,
+                    "warnings": ["No queries generated"]
+                }
     
     async def check_health(self) -> Dict[str, bool]:
         """
@@ -871,23 +548,28 @@ async def run_interactive_planning(
     return prp_text
 
 
-def print_query_results(results: Dict[str, Any], output_dir: Path) -> None:
+def print_query_results(results: Dict[str, Any], output_dir: Path, target_name: str = "") -> None:
     """
     Pretty print query generation results.
     
     Args:
         results: Query generation results
         output_dir: Directory to save output files
+        target_name: Optional target table name for context
     """
     # Save query results to file
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    query_file = output_dir / f"query_results_{timestamp}.json"
+    safe_target = target_name.replace(" ", "_") if target_name else "queries"
+    query_file = output_dir / f"{safe_target}_{timestamp}.json"
     query_file.write_text(json.dumps(results, indent=2))
     print(f"💾 Saved query results to: {query_file}")
     print()
     
     print("=" * 100)
-    print("QUERY GENERATION RESULTS")
+    if target_name:
+        print(f"QUERY GENERATION: {target_name}")
+    else:
+        print("QUERY GENERATION RESULTS")
     print("=" * 100)
     print()
     
@@ -977,65 +659,15 @@ def print_query_results(results: Dict[str, Any], output_dir: Path) -> None:
                 print()
     
     print("=" * 100)
-    
-    # Summary recommendations
-    valid_count = sum(1 for q in queries if q.get("validation_status") == "valid")
-    
-    if valid_count > 0:
-        print()
-        print(f"✓ {valid_count} valid {'query' if valid_count == 1 else 'queries'} ready for execution in BigQuery!")
-        print()
-        print("Next steps:")
-        print("   1. Review the SQL queries above")
-        print("   2. Execute in BigQuery console or via API")
-        print("   3. Analyze results")
-    else:
-        print()
-        print("⚠️  No valid queries generated. Consider:")
-        print("   - Refining your insight to be more specific")
-        print("   - Checking if datasets contain relevant fields")
-        print("   - Reviewing error messages for guidance")
-
-
-def print_all_query_results(
-    all_results: List[Dict[str, Any]], 
-    output_dir: Path
-) -> None:
-    """
-    Print query generation results for multiple insights.
-    
-    Args:
-        all_results: List of {insight, results} dicts
-        output_dir: Output directory
-    """
-    # Save combined results
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    combined_file = output_dir / f"all_query_results_{timestamp}.json"
-    combined_file.write_text(json.dumps(all_results, indent=2))
-    print(f"💾 Saved all results to: {combined_file}")
-    print()
-    
-    # Print each insight's results
-    for i, item in enumerate(all_results, 1):
-        print("=" * 100)
-        print(f"INSIGHT {i}/{len(all_results)}")
-        print("=" * 100)
-        print()
-        print(f"📋 Insight: {item['insight']}")
-        print()
-        
-        # Print queries for this insight
-        print_query_results(item['results'], output_dir)
-        print()
 
 
 async def main(
     initial_intent: Optional[str] = None,
     prp_file: Optional[str] = None,
-    max_results: int = 5,
+    max_results_per_query: int = 5,
+    max_planning_turns: int = 10,
     max_queries: int = 3,
     max_iterations: int = 10,
-    max_planning_turns: int = 10,
     planning_url: str = "http://localhost:8082",
     discovery_url: str = "http://localhost:8080",
     query_gen_url: str = "http://localhost:8081"
@@ -1043,15 +675,15 @@ async def main(
     """
     Run the integrated workflow example.
     
-    Insights are automatically extracted from the PRP based on discovered datasets.
+    Generates SELECT queries for all target tables defined in PRP Section 9.
     
     Args:
         initial_intent: Initial business intent for planning
         prp_file: Path to existing PRP file (skips planning phase)
-        max_results: Maximum datasets to discover from PRP
-        max_queries: Maximum number of queries to generate per insight
-        max_iterations: Maximum refinement iterations per query
+        max_results_per_query: Maximum source tables to discover per target
         max_planning_turns: Maximum Q&A turns in planning phase
+        max_queries: Maximum number of queries to generate per target
+        max_iterations: Maximum refinement iterations per query
         planning_url: Data planning agent URL
         discovery_url: Data discovery agent URL
         query_gen_url: Query generation agent URL
@@ -1125,53 +757,84 @@ async def main(
         # Interactive Planning (Q&A)
         prp_text = await run_interactive_planning(client, initial_intent, max_planning_turns)
     
-    # Step 2: Discover datasets from PRP
-    datasets = await client.discover_datasets_from_prp(
+    # Step 2: Discover source tables for PRP Section 9 targets
+    discovery_results = await client.discover_source_tables_from_prp(
         prp_text=prp_text,
-        max_results=max_results
+        max_results_per_query=max_results_per_query
     )
     
-    if not datasets:
-        print("No datasets found. Exiting.")
+    target_tables = discovery_results.get("target_tables", [])
+    
+    if not target_tables:
+        print("No target tables found in PRP Section 9. Exiting.")
         return
     
-    # Step 3: Extract insights from PRP + datasets
-    print("💡 Extracting insights from PRP grounded in discovered datasets...")
-    insights = await client.extract_insights_from_prp(
-        prp_text=prp_text,
-        datasets=datasets,
-        max_insights=3
-    )
+    print(f"📋 Target Tables from Section 9:")
+    for i, target in enumerate(target_tables, 1):
+        print(f"   {i}. {target['target_table_name']}")
+        print(f"      Sources found: {len(target.get('discovered_tables', []))}")
+    print()
     
-    if not insights:
-        print("✗ No insights extracted. Exiting.")
-        return
+    # Step 3: Generate queries for each target table (best effort)
+    all_query_results = []
+    successful_queries = 0
+    failed_queries = 0
     
-    # Step 4: Generate queries for each insight
-    all_results = []
-    
-    for i, current_insight in enumerate(insights, 1):
+    for i, target in enumerate(target_tables, 1):
         print("=" * 100)
-        print(f"GENERATING QUERIES FOR INSIGHT {i}/{len(insights)}")
+        print(f"GENERATING QUERIES {i}/{len(target_tables)}")
         print("=" * 100)
         print()
         
-        results = await client.generate_queries(
-            insight=current_insight,
-            datasets=datasets,
-            max_queries=max_queries,
-            max_iterations=max_iterations
-        )
-        
-        all_results.append({
-            "insight": current_insight,
-            "results": results
-        })
+        try:
+            query_results = await client.generate_queries_for_target(
+                target_table_name=target["target_table_name"],
+                target_description=target["target_description"],
+                target_columns=target["target_columns"],
+                source_datasets=target["discovered_tables"],
+                max_queries=max_queries,
+                max_iterations=max_iterations
+            )
+            
+            all_query_results.append({
+                "target_table": target["target_table_name"],
+                "results": query_results
+            })
+            
+            # Print results
+            print_query_results(
+                query_results,
+                client.output_dir,
+                target["target_table_name"]
+            )
+            
+            if query_results.get("total_validated", 0) > 0:
+                successful_queries += 1
+            else:
+                failed_queries += 1
+            
+        except Exception as e:
+            print(f"✗ Error generating queries for {target['target_table_name']}: {e}")
+            failed_queries += 1
         
         print()
     
-    # Step 5: Display all results
-    print_all_query_results(all_results, client.output_dir)
+    # Step 4: Final Summary
+    print("=" * 100)
+    print("WORKFLOW COMPLETE")
+    print("=" * 100)
+    print()
+    print(f"📊 Summary:")
+    print(f"   Target tables: {len(target_tables)}")
+    print(f"   ✓ Successful: {successful_queries}")
+    print(f"   ✗ Failed: {failed_queries}")
+    print()
+    
+    if successful_queries > 0:
+        print("Next steps:")
+        print("   1. Review generated queries in output/ directory")
+        print("   2. Execute queries in BigQuery to validate results")
+        print("   3. Verify query outputs match target schemas")
 
 
 def parse_args() -> argparse.Namespace:
@@ -1186,10 +849,10 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Use defaults (interactive Q&A, auto-extract insights)
+  # Use defaults (interactive Q&A)
   python integrated_workflow_example.py
   
-  # Custom initial intent (insights auto-extracted from PRP)
+  # Custom initial intent
   python integrated_workflow_example.py \\
     --initial-intent "Analyze customer behavior patterns"
   
@@ -1197,12 +860,9 @@ Examples:
   python integrated_workflow_example.py \\
     --prp-file output/prp_20250101_120000.md
   
-  # Control planning and query generation
+  # Control query generation parameters
   python integrated_workflow_example.py \\
-    --initial-intent "Track product performance metrics" \\
-    --max-planning-turns 5 \\
-    --max-results 10 \\
-    --max-queries 3 \\
+    --max-queries 5 \\
     --max-iterations 15
         """
     )
@@ -1230,10 +890,10 @@ Examples:
     
     # Discovery configuration
     parser.add_argument(
-        "--max-results",
+        "--max-results-per-query",
         type=int,
         default=5,
-        help="Maximum datasets to discover from PRP (default: 5)"
+        help="Maximum source tables to discover per search query (default: 5)"
     )
     
     # Query generation configuration
@@ -1241,7 +901,7 @@ Examples:
         "--max-queries",
         type=int,
         default=3,
-        help="Maximum number of queries to generate (default: 3)"
+        help="Maximum number of queries to generate per target (default: 3)"
     )
     
     parser.add_argument(
@@ -1295,10 +955,10 @@ if __name__ == "__main__":
     asyncio.run(main(
         initial_intent=args.initial_intent,
         prp_file=args.prp_file,
-        max_results=args.max_results,
+        max_results_per_query=args.max_results_per_query,
+        max_planning_turns=args.max_planning_turns,
         max_queries=args.max_queries,
         max_iterations=args.max_iterations,
-        max_planning_turns=args.max_planning_turns,
         planning_url=args.planning_url,
         discovery_url=args.discovery_url,
         query_gen_url=args.query_gen_url

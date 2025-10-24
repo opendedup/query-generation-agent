@@ -14,6 +14,7 @@ class DatasetMetadata(BaseModel):
     Metadata for a discovered dataset from data-discovery-agent.
     
     Contains schema information and documentation needed for query generation.
+    Enhanced with rich metadata for better SQL query generation.
     """
     
     # Identity
@@ -22,19 +23,51 @@ class DatasetMetadata(BaseModel):
     table_id: str = Field(..., description="BigQuery table ID")
     asset_type: str = Field(..., description="Asset type (table, view, etc.)")
     
+    # Description
+    description: Optional[str] = Field(None, description="Table/view description")
+    
     # Size metrics
     row_count: Optional[int] = Field(None, description="Number of rows in table")
     size_bytes: Optional[int] = Field(None, description="Size in bytes")
     column_count: Optional[int] = Field(None, description="Number of columns")
     
-    # Schema information
-    schema_fields: List[Dict[str, Any]] = Field(
+    # Timestamps (renamed fields from data-discovery-agent v2.0)
+    created: Optional[str] = Field(None, description="Creation timestamp")
+    last_modified: Optional[str] = Field(None, description="Last modification timestamp")
+    insert_timestamp: Optional[str] = Field(None, description="When indexed")
+    
+    # Schema information (ENHANCED with sample values)
+    schema: List[Dict[str, Any]] = Field(
         default_factory=list,
-        description="Field names, types, and descriptions"
+        description="Column definitions with name, type, description, sample_values"
     )
     
-    # Documentation
-    full_markdown: str = Field(..., description="Complete markdown documentation")
+    # NEW: Column statistics for intelligent query generation
+    column_profiles: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Column statistics: distinct_count, null_percentage, min/max, avg"
+    )
+    
+    # NEW: Data lineage information
+    lineage: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Data lineage with source and target relationships"
+    )
+    
+    # NEW: AI-generated analytical insights
+    analytical_insights: List[str] = Field(
+        default_factory=list,
+        description="Example analytical questions about this data"
+    )
+    
+    # NEW: Key metrics
+    key_metrics: List[Any] = Field(
+        default_factory=list,
+        description="Important business metrics"
+    )
+    
+    # Documentation (keep for backwards compatibility)
+    full_markdown: str = Field(default="", description="Complete markdown documentation")
     
     # Optional metadata
     has_pii: bool = Field(default=False, description="Contains PII data")
@@ -42,6 +75,12 @@ class DatasetMetadata(BaseModel):
     environment: Optional[str] = Field(None, description="Environment (prod, staging, dev)")
     owner_email: Optional[str] = Field(None, description="Dataset owner")
     tags: List[str] = Field(default_factory=list, description="Dataset tags")
+    
+    # Backwards compatibility: alias schema_fields → schema
+    @property
+    def schema_fields(self) -> List[Dict[str, Any]]:
+        """Alias for backwards compatibility."""
+        return self.schema
     
     def get_full_table_id(self) -> str:
         """
@@ -74,6 +113,68 @@ class DatasetMetadata(BaseModel):
             lines.append(line)
         
         return "\n".join(lines)
+    
+    def get_column_profile(self, column_name: str) -> Optional[Dict[str, Any]]:
+        """
+        Get statistics for a specific column.
+        
+        Args:
+            column_name: Name of the column
+            
+        Returns:
+            Column profile dict or None if not found
+        """
+        for profile in self.column_profiles:
+            if profile.get("column_name") == column_name:
+                return profile
+        return None
+    
+    def get_numeric_columns(self) -> List[str]:
+        """
+        Get list of numeric column names for aggregations.
+        
+        Returns:
+            List of numeric column names
+        """
+        numeric_types = ["INTEGER", "INT64", "FLOAT", "FLOAT64", "NUMERIC", "DECIMAL"]
+        numeric_cols = []
+        for field in self.schema:
+            if field.get("type") in numeric_types:
+                numeric_cols.append(field.get("name"))
+        return numeric_cols
+    
+    def get_date_columns(self) -> List[str]:
+        """
+        Get list of date/timestamp columns for filtering.
+        
+        Returns:
+            List of date/timestamp column names
+        """
+        date_types = ["DATE", "DATETIME", "TIMESTAMP"]
+        date_cols = []
+        for field in self.schema:
+            if field.get("type") in date_types:
+                date_cols.append(field.get("name"))
+        return date_cols
+    
+    def get_column_value_range(self, column_name: str) -> Optional[Dict[str, Any]]:
+        """
+        Get min/max value range for a column.
+        
+        Args:
+            column_name: Name of the column
+            
+        Returns:
+            Dict with min, max, avg values or None if not available
+        """
+        profile = self.get_column_profile(column_name)
+        if profile:
+            return {
+                "min": profile.get("min_value"),
+                "max": profile.get("max_value"),
+                "avg": profile.get("avg_value")
+            }
+        return None
     
     class Config:
         """Pydantic configuration."""
@@ -188,6 +289,66 @@ class GenerateQueriesRequest(BaseModel):
                 ],
                 "max_queries": 3,
                 "max_iterations": 10
+            }
+        }
+
+
+class GenerateViewsRequest(BaseModel):
+    """
+    Request to generate CREATE VIEW statements from PRP data requirements.
+    
+    Takes PRP markdown (Section 9) and source datasets, generates DDL statements
+    that create views matching the target schemas defined in the PRP.
+    """
+    
+    prp_markdown: str = Field(
+        ...,
+        description="PRP markdown containing Section 9 data requirements",
+        min_length=50
+    )
+    
+    source_datasets: List[DatasetMetadata] = Field(
+        ...,
+        description="Available source tables from data discovery"
+    )
+    
+    target_project: Optional[str] = Field(
+        None,
+        description="GCP project ID where views should be created"
+    )
+    
+    target_dataset: Optional[str] = Field(
+        None,
+        description="BigQuery dataset where views should be created"
+    )
+    
+    def get_target_location(self) -> str:
+        """
+        Get the target location for views.
+        
+        Returns:
+            Target location in format project.dataset or empty string
+        """
+        if self.target_project and self.target_dataset:
+            return f"{self.target_project}.{self.target_dataset}"
+        return ""
+    
+    class Config:
+        """Pydantic configuration."""
+        json_schema_extra = {
+            "example": {
+                "prp_markdown": "## 9. Data Requirements\n### Table: `ensemble_predictions`\n...",
+                "source_datasets": [
+                    {
+                        "project_id": "my-project",
+                        "dataset_id": "nfl",
+                        "table_id": "games",
+                        "asset_type": "table",
+                        "schema": []
+                    }
+                ],
+                "target_project": "my-project",
+                "target_dataset": "analytics"
             }
         }
 

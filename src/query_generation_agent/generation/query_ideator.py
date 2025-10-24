@@ -115,7 +115,7 @@ class QueryIdeator:
             datasets: List of DatasetMetadata objects
             
         Returns:
-            List of dataset dictionaries
+            List of dataset dictionaries with rich metadata
         """
         dataset_dicts = []
         
@@ -125,10 +125,22 @@ class QueryIdeator:
                 "dataset_id": dataset.dataset_id,
                 "table_id": dataset.table_id,
                 "asset_type": dataset.asset_type,
+                "description": dataset.description,
+                
+                # Size metrics
                 "row_count": dataset.row_count,
                 "size_bytes": dataset.size_bytes,
                 "column_count": dataset.column_count,
-                "schema_fields": dataset.schema_fields,
+                
+                # Rich metadata fields
+                "schema": dataset.schema,
+                "schema_fields": dataset.schema_fields,  # Keep for backwards compatibility
+                "column_profiles": dataset.column_profiles,
+                "lineage": dataset.lineage,
+                "analytical_insights": dataset.analytical_insights,
+                "key_metrics": dataset.key_metrics,
+                
+                # Legacy/optional
                 "full_markdown": dataset.full_markdown,
                 "has_pii": dataset.has_pii,
                 "has_phi": dataset.has_phi,

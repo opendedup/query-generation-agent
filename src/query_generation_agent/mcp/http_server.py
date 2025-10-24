@@ -265,10 +265,12 @@ def create_http_app() -> FastAPI:
             logger.info(f"Tool called via HTTP: {tool_name}")
             
             # Call tool handler
-            from .tools import GENERATE_QUERIES_TOOL
+            from .tools import GENERATE_QUERIES_TOOL, GENERATE_VIEWS_TOOL
             
             if tool_name == GENERATE_QUERIES_TOOL:
                 result = await handlers_instance.handle_generate_queries(arguments)
+            elif tool_name == GENERATE_VIEWS_TOOL:
+                result = await handlers_instance.handle_generate_views(arguments)
             else:
                 raise HTTPException(status_code=404, detail=f"Unknown tool: {tool_name}")
             
@@ -325,7 +327,7 @@ def create_http_app() -> FastAPI:
             task_manager_instance.create_task(task_id)
             
             # Start background execution
-            from .tools import GENERATE_QUERIES_TOOL
+            from .tools import GENERATE_QUERIES_TOOL, GENERATE_VIEWS_TOOL
             
             if tool_name == GENERATE_QUERIES_TOOL:
                 asyncio.create_task(
@@ -333,6 +335,21 @@ def create_http_app() -> FastAPI:
                         task_id, arguments, task_manager_instance
                     )
                 )
+            elif tool_name == GENERATE_VIEWS_TOOL:
+                # Generate views synchronously (usually fast) then update task
+                async def generate_views_task():
+                    try:
+                        from .task_manager import TaskStatus
+                        task_manager_instance.update_task_status(task_id, TaskStatus.RUNNING)
+                        result = await handlers_instance.handle_generate_views(arguments)
+                        task_manager_instance.update_task_status(
+                            task_id, TaskStatus.COMPLETED, result=result
+                        )
+                    except Exception as e:
+                        task_manager_instance.update_task_status(
+                            task_id, TaskStatus.FAILED, error=str(e)
+                        )
+                asyncio.create_task(generate_views_task())
             else:
                 raise HTTPException(status_code=404, detail=f"Unknown tool: {tool_name}")
             

@@ -85,6 +85,10 @@ class QueryResult(BaseModel):
     # Query
     sql: str = Field(..., description="The BigQuery SQL query")
     description: str = Field(..., description="Natural language description")
+    source_tables: List[str] = Field(
+        ...,
+        description="Fully qualified table names used in query (project.dataset.table)"
+    )
     
     # Validation
     validation_status: Literal["valid", "failed"] = Field(
@@ -150,6 +154,7 @@ class QueryResult(BaseModel):
             "example": {
                 "sql": "SELECT payment_method, AVG(amount) as avg_amount FROM `project.sales.transactions` WHERE DATE(timestamp) BETWEEN '2024-10-01' AND '2024-12-31' GROUP BY payment_method",
                 "description": "Calculate average transaction amount by payment method for Q4 2024",
+                "source_tables": ["project.sales.transactions"],
                 "validation_status": "valid",
                 "validation_details": {
                     "is_valid": True,
@@ -255,6 +260,7 @@ class GenerateQueriesResponse(BaseModel):
                     {
                         "sql": "SELECT payment_method, AVG(amount) FROM transactions GROUP BY 1",
                         "description": "Average transaction by payment method",
+                        "source_tables": ["project.sales.transactions"],
                         "validation_status": "valid",
                         "validation_details": {"is_valid": True},
                         "alignment_score": 0.92,

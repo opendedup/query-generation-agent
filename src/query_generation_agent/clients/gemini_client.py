@@ -74,6 +74,11 @@ class GeminiClient:
             prompt = self._build_generation_prompt(insight, datasets, num_queries)
             
             logger.debug(f"Generating {num_queries} queries for insight")
+            logger.debug("=" * 80)
+            logger.debug("LLM CONTEXT - QUERY GENERATION:")
+            logger.debug("-" * 80)
+            logger.debug(prompt)
+            logger.debug("=" * 80)
             
             response = self._call_with_retry(prompt, json_mode=True)
             
@@ -123,6 +128,11 @@ class GeminiClient:
             prompt = self._build_refinement_prompt(original_sql, feedback, insight, datasets)
             
             logger.debug("Refining query based on feedback")
+            logger.debug("=" * 80)
+            logger.debug("LLM CONTEXT - QUERY REFINEMENT:")
+            logger.debug("-" * 80)
+            logger.debug(prompt)
+            logger.debug("=" * 80)
             
             response = self._call_with_retry(prompt, json_mode=True)
             
@@ -173,6 +183,11 @@ class GeminiClient:
             prompt = self._build_alignment_prompt(insight, sql, sample_results, schema)
             
             logger.debug("Validating query alignment with insight")
+            logger.debug("=" * 80)
+            logger.debug("LLM CONTEXT - ALIGNMENT VALIDATION:")
+            logger.debug("-" * 80)
+            logger.debug(prompt)
+            logger.debug("=" * 80)
             
             response = self._call_with_retry(prompt, json_mode=True)
             
@@ -220,6 +235,13 @@ class GeminiClient:
                     prompt,
                     generation_config=generation_config
                 )
+                
+                # Log the response for debugging
+                logger.debug("=" * 80)
+                logger.debug("LLM RESPONSE:")
+                logger.debug("-" * 80)
+                logger.debug(response.text)
+                logger.debug("=" * 80)
                 
                 return response.text
                 
@@ -365,7 +387,8 @@ Generate the corrected query now:"""
         schema_text = "\n".join([f"- {field['name']} ({field['type']})" for field in schema])
         
         # Format sample results (limit to first 5 rows for brevity)
-        sample_text = json.dumps(sample_results[:5], indent=2)
+        # Convert datetime objects to strings for JSON serialization
+        sample_text = json.dumps(sample_results[:5], indent=2, default=str)
         
         prompt = f"""You are an expert data analyst. Evaluate whether a SQL query's results align with the intended data science insight.
 
@@ -426,4 +449,41 @@ Provide your evaluation now:"""
             lines.append(line)
         
         return "\n".join(lines)
+    
+    def generate_view_ddl(self, prompt: str) -> Tuple[bool, Optional[str], str]:
+        """
+        Generate CREATE VIEW DDL statement from prompt.
+        
+        Args:
+            prompt: Formatted prompt with target schema and source tables
+            
+        Returns:
+            Tuple of (success, error_message, ddl_statement)
+        """
+        try:
+            logger.debug("Generating VIEW DDL")
+            logger.debug("=" * 80)
+            logger.debug("LLM CONTEXT - VIEW DDL GENERATION:")
+            logger.debug("-" * 80)
+            logger.debug(prompt)
+            logger.debug("=" * 80)
+            
+            response = self._call_with_retry(prompt, json_mode=False)
+            
+            if not response:
+                return False, "Failed to get response from Gemini", ""
+            
+            # Response should be DDL directly (not JSON)
+            ddl = response.strip()
+            
+            if not ddl:
+                return False, "Empty DDL returned from Gemini", ""
+            
+            logger.info(f"Successfully generated VIEW DDL ({len(ddl)} chars)")
+            return True, None, ddl
+            
+        except Exception as e:
+            error_msg = f"Error generating VIEW DDL: {str(e)}"
+            logger.error(error_msg, exc_info=True)
+            return False, error_msg, ""
 
