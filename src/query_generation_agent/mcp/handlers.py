@@ -8,7 +8,7 @@ import asyncio
 import json
 import logging
 import time
-from typing import Any, Dict, Sequence
+from typing import Any, Dict, List, Sequence
 
 from mcp.types import TextContent
 
@@ -18,7 +18,7 @@ from ..generation.query_ideator import QueryIdeator
 from ..generation.query_refiner import QueryRefiner
 from ..generation.view_generator import ViewGenerator
 from ..models.request_models import DatasetMetadata, GenerateQueriesRequest, GenerateViewsRequest
-from ..models.response_models import GenerateQueriesResponse, QueryResult
+from ..models.response_models import GenerateQueriesResponse, QueryResult, TokenUsage
 from ..parsers.prp_parser import parse_prp_section_9
 from ..validation.alignment_validator import AlignmentValidator
 from ..validation.dryrun_validator import DryRunValidator
@@ -99,14 +99,28 @@ class MCPHandlers:
             logger.info(f"Max queries: {request.max_queries}")
             logger.info(f"Max iterations: {request.max_iterations}")
             
+            # Initialize token usage tracking
+            total_prompt_tokens = 0
+            total_completion_tokens = 0
+            total_llm_calls = 0
+            generation_tokens = 0
+            refinement_tokens = 0
+            alignment_tokens = 0
+            
             # Step 1: Generate initial query candidates
             # Run in thread pool to avoid blocking the async event loop
-            success, error_msg, candidates = await asyncio.to_thread(
+            success, error_msg, candidates, gen_usage = await asyncio.to_thread(
                 self.query_ideator.generate_candidates,
                 insight=request.insight,
                 datasets=request.datasets,
                 num_queries=request.max_queries
             )
+            
+            # Track generation usage
+            total_prompt_tokens += gen_usage.get("prompt_tokens", 0)
+            total_completion_tokens += gen_usage.get("completion_tokens", 0)
+            total_llm_calls += 1
+            generation_tokens += gen_usage.get("total_tokens", 0)
             
             if not success or not candidates:
                 error_response = {
@@ -137,10 +151,25 @@ class MCPHandlers:
                         initial_sql=candidate["sql"],
                         description=candidate["description"],
                         insight=request.insight,
-                        datasets=request.datasets
+                        datasets=request.datasets,
+                        target_table_name=request.target_table_name,
+                        query_index=i
                     )
                     
                     validated_queries.append(query_result)
+                    
+                    # Aggregate per-query token usage
+                    if query_result.token_usage:
+                        query_usage = query_result.token_usage
+                        refinement_tokens += query_usage.get("refinement_tokens", 0)
+                        alignment_tokens += query_usage.get("alignment_tokens", 0)
+                        total_llm_calls += query_usage.get("llm_calls", 0)
+                        # Also add to total prompt/completion tokens
+                        # (approximation since we don't split refine vs align in per-query)
+                        total_prompt_tokens += query_usage.get("refinement_tokens", 0) // 2
+                        total_completion_tokens += query_usage.get("refinement_tokens", 0) // 2
+                        total_prompt_tokens += query_usage.get("alignment_tokens", 0) // 2
+                        total_completion_tokens += query_usage.get("alignment_tokens", 0) // 2
                     
                     if query_result.is_valid():
                         logger.info(
@@ -160,16 +189,53 @@ class MCPHandlers:
                     logger.error(f"Error processing candidate {i+1}: {e}", exc_info=True)
                     warnings.append(f"Failed to process candidate {i+1}: {str(e)}")
             
+            # Derive project_name from target_table_name
+            project_name = None
+            if request.target_table_name:
+                project_name = request.target_table_name.replace("_", "-")
+            
+            # Build token usage summary
+            total_tokens = total_prompt_tokens + total_completion_tokens
+            token_usage = TokenUsage(
+                prompt_tokens=total_prompt_tokens,
+                completion_tokens=total_completion_tokens,
+                total_tokens=total_tokens,
+                generation_tokens=generation_tokens,
+                refinement_tokens=refinement_tokens,
+                alignment_tokens=alignment_tokens,
+                llm_calls=total_llm_calls
+            )
+            
+            # Generate diagnostic report if all candidates failed
+            failure_diagnostic_markdown = None
+            total_validated_count = len([q for q in validated_queries if q.is_valid()])
+            
+            if total_validated_count == 0 and validated_queries:
+                failure_diagnostic_markdown = self._generate_failure_diagnostic_markdown(
+                    candidates=candidates,
+                    validated_queries=validated_queries,
+                    insight=request.insight
+                )
+                
+                # Add to warnings for backward compatibility
+                warnings.append("All candidates failed - see diagnostic report")
+                
+                logger.warning(f"All {len(candidates)} candidates failed. Diagnostic report generated.")
+                logger.info(f"Failure diagnostic:\n{failure_diagnostic_markdown}")
+            
             # Build response
             response = GenerateQueriesResponse(
+                project_name=project_name,
                 queries=validated_queries,
                 total_attempted=len(candidates),
-                total_validated=len([q for q in validated_queries if q.is_valid()]),
+                total_validated=total_validated_count,
                 execution_time_ms=(time.time() - start_time) * 1000,
                 insight=request.insight,
                 dataset_count=len(request.datasets),
                 summary=None,
-                warnings=warnings
+                warnings=warnings,
+                token_usage=token_usage,
+                failure_diagnostic=failure_diagnostic_markdown
             )
             
             # Generate summary
@@ -252,6 +318,238 @@ class MCPHandlers:
         )
         
         return request
+    
+    def _generate_failure_diagnostic_markdown(
+        self,
+        candidates: List[Dict[str, Any]],
+        validated_queries: List[QueryResult],
+        insight: str
+    ) -> str:
+        """
+        Generate markdown-formatted failure diagnostic when all candidates fail.
+        
+        Analyzes failure patterns, table combinations, and provides recommendations.
+        
+        Args:
+            candidates: Original candidate queries
+            validated_queries: Validated query results
+            insight: Original insight request
+            
+        Returns:
+            Markdown-formatted diagnostic report
+        """
+        # Track failure patterns
+        all_zero_rows = True
+        all_syntax_errors = True
+        alignment_scores = []
+        common_errors: Dict[str, int] = {}
+        all_tables_used = set()
+        table_combination_failures: Dict[tuple, Dict[str, Any]] = {}
+        
+        candidates_analysis = []
+        
+        for i, query_result in enumerate(validated_queries):
+            # Track all tables used
+            all_tables_used.update(query_result.source_tables)
+            
+            # Track table combination failures
+            table_combo = tuple(sorted(query_result.source_tables))
+            if table_combo:
+                if table_combo not in table_combination_failures:
+                    table_combination_failures[table_combo] = {
+                        "count": 0,
+                        "zero_rows": 0,
+                        "candidates": []
+                    }
+                table_combination_failures[table_combo]["count"] += 1
+                table_combination_failures[table_combo]["candidates"].append(i + 1)
+            
+            # Analyze validation details
+            val_details = query_result.validation_details
+            
+            # Check for zero rows
+            rows_returned = 0
+            if val_details.sample_results is not None:
+                rows_returned = len(val_details.sample_results)
+                if rows_returned > 0:
+                    all_zero_rows = False
+                else:
+                    # Track zero row failures by table combination
+                    if table_combo:
+                        table_combination_failures[table_combo]["zero_rows"] += 1
+            else:
+                # Track zero row failures by table combination
+                if table_combo:
+                    table_combination_failures[table_combo]["zero_rows"] += 1
+            
+            # Check syntax/dryrun
+            if val_details.syntax_valid and val_details.dryrun_valid:
+                all_syntax_errors = False
+            
+            # Collect errors
+            if val_details.error_message:
+                error_type = val_details.error_type or "unknown"
+                common_errors[error_type] = common_errors.get(error_type, 0) + 1
+            
+            # Collect alignment info
+            if val_details.alignment_score is not None:
+                alignment_scores.append(val_details.alignment_score)
+            
+            # Build candidate analysis
+            candidates_analysis.append({
+                "number": i + 1,
+                "iterations": query_result.iterations,
+                "rows_returned": rows_returned,
+                "alignment_score": query_result.alignment_score,
+                "tables": query_result.source_tables,
+                "error": val_details.error_message,
+                "reasoning": val_details.alignment_reasoning
+            })
+        
+        # Build markdown output
+        md_lines = [
+            "# Query Generation Failure Analysis",
+            "",
+            f"**Insight**: {insight[:200]}{'...' if len(insight) > 200 else ''}",
+            f"**Candidates Attempted**: {len(candidates)}",
+            f"**Successful**: 0",
+            f"**Execution Time**: {sum(q.generation_time_ms for q in validated_queries) / 1000:.1f}s",
+            "",
+            "---",
+            "",
+            "## Tables Attempted",
+            ""
+        ]
+        
+        # List all tables
+        for table in sorted(all_tables_used):
+            md_lines.append(f"- `{table}`")
+        
+        # Table combination analysis
+        if table_combination_failures:
+            md_lines.extend([
+                "",
+                "## Table Combination Analysis",
+                "",
+                "| Tables | Attempts | Zero Row Results | Candidates |",
+                "|--------|----------|------------------|------------|"
+            ])
+            
+            for table_combo, stats in sorted(table_combination_failures.items()):
+                table_names = [t.split('.')[-1] for t in table_combo]
+                tables_str = " + ".join(table_names)
+                candidates_str = ", ".join([f"#{c}" for c in stats["candidates"]])
+                md_lines.append(
+                    f"| {tables_str} | {stats['count']} | {stats['zero_rows']} | {candidates_str} |"
+                )
+        
+        # Root causes
+        md_lines.extend([
+            "",
+            "## Root Causes",
+            ""
+        ])
+        
+        cause_num = 1
+        if all_zero_rows:
+            md_lines.append(
+                f"{cause_num}. **All queries returned 0 rows** - this indicates a data availability issue"
+            )
+            cause_num += 1
+        
+        if all_syntax_errors:
+            md_lines.append(f"{cause_num}. **Syntax or schema errors** prevented query execution")
+            cause_num += 1
+        
+        if alignment_scores and not all_zero_rows:
+            avg_score = sum(alignment_scores) / len(alignment_scores)
+            md_lines.append(
+                f"{cause_num}. **Queries executed but didn't align with insight** "
+                f"(avg alignment score: {avg_score:.2f})"
+            )
+            cause_num += 1
+        
+        if len(all_tables_used) > 1 and all_zero_rows:
+            md_lines.append(f"{cause_num}. **JOIN keys between tables may be incompatible**")
+            cause_num += 1
+        
+        # Recommendations
+        md_lines.extend([
+            "",
+            "## Recommendations",
+            ""
+        ])
+        
+        rec_num = 1
+        if all_zero_rows:
+            md_lines.extend([
+                f"{rec_num}. Verify that the requested data exists in the source tables",
+                f"{rec_num + 1}. Check if temporal filters (e.g., 'recent dates', 'future dates') are excluding all data",
+                f"{rec_num + 2}. Confirm that JOIN keys between tables are compatible (matching IDs, timestamps, etc.)"
+            ])
+            rec_num += 3
+            
+            if len(all_tables_used) > 1:
+                table_names = [t.split('.')[-1] for t in sorted(all_tables_used)]
+                md_lines.append(
+                    f"{rec_num}. Verify JOIN compatibility between: "
+                    f"{', '.join([f'`{t}`' for t in table_names])}"
+                )
+                rec_num += 1
+            
+            # Identify problematic table combinations
+            for table_combo, stats in table_combination_failures.items():
+                if stats["zero_rows"] == stats["count"] and stats["count"] > 1:
+                    table_names = [t.split('.')[-1] for t in table_combo]
+                    md_lines.append(
+                        f"{rec_num}. **Critical**: Table combination "
+                        f"`{' + '.join(table_names)}` consistently failed "
+                        f"(tried {stats['count']} times, 0 rows every time)"
+                    )
+                    rec_num += 1
+        
+        if all_syntax_errors:
+            md_lines.append(f"{rec_num}. Review table schemas and column names for accuracy")
+            rec_num += 1
+        
+        # Candidate details
+        md_lines.extend([
+            "",
+            "---",
+            "",
+            "## Candidate Details",
+            ""
+        ])
+        
+        for analysis in candidates_analysis:
+            table_names = [t.split('.')[-1] for t in analysis["tables"]]
+            tables_str = ", ".join([f"`{t}`" for t in table_names]) if table_names else "none"
+            
+            md_lines.extend([
+                f"### Candidate {analysis['number']}",
+                f"- **Iterations**: {analysis['iterations']}",
+                f"- **Rows Returned**: {analysis['rows_returned']}",
+                f"- **Alignment Score**: {analysis['alignment_score']:.2f}",
+                f"- **Tables**: {tables_str}"
+            ])
+            
+            if analysis["error"]:
+                # Truncate long error messages
+                error_msg = analysis["error"][:300]
+                if len(analysis["error"]) > 300:
+                    error_msg += "..."
+                md_lines.append(f"- **Error**: {error_msg}")
+            
+            if analysis["reasoning"]:
+                # Truncate long reasoning
+                reasoning = analysis["reasoning"][:300]
+                if len(analysis["reasoning"]) > 300:
+                    reasoning += "..."
+                md_lines.append(f"- **Reasoning**: {reasoning}")
+            
+            md_lines.append("")
+        
+        return "\n".join(md_lines)
     
     async def handle_generate_queries_async(
         self,

@@ -61,7 +61,9 @@ class QueryRefiner:
         initial_sql: str,
         description: str,
         insight: str,
-        datasets: List[DatasetMetadata]
+        datasets: List[DatasetMetadata],
+        target_table_name: Optional[str] = None,
+        query_index: int = 0
     ) -> QueryResult:
         """
         Refine and validate a query candidate through iterative feedback.
@@ -72,6 +74,8 @@ class QueryRefiner:
             description: Query description
             insight: Original insight
             datasets: Available datasets
+            target_table_name: Name of target table for query naming
+            query_index: Index of this query for unique naming
             
         Returns:
             QueryResult with final validation status
@@ -96,6 +100,12 @@ class QueryRefiner:
         
         current_sql = initial_sql
         iteration = 0
+        consecutive_zero_rows = 0
+        
+        # Track token usage for this query
+        query_refinement_tokens = 0
+        query_alignment_tokens = 0
+        query_llm_calls = 0
         
         while iteration < self.max_iterations:
             iteration_start = time.time()
@@ -111,17 +121,36 @@ class QueryRefiner:
             )
             
             # Run validation pipeline
-            is_valid, final_score, validation_details = self._run_validation_pipeline(
+            is_valid, final_score, validation_details, align_usage = self._run_validation_pipeline(
                 sql=current_sql,
                 insight=insight,
-                iter_state=iter_state
+                iter_state=iter_state,
+                datasets=datasets
             )
+            
+            # Track alignment token usage
+            query_alignment_tokens += align_usage.get("total_tokens", 0)
+            query_llm_calls += 1
             
             # Update iteration timing
             iter_state.iteration_time_ms = (time.time() - iteration_start) * 1000
             
             # Add iteration to history
             history.add_iteration(iter_state)
+            
+            # Check for consecutive zero-row results (fail fast)
+            sample_results = validation_details.get("sample_results")
+            if sample_results is not None and len(sample_results) == 0:
+                consecutive_zero_rows += 1
+                if consecutive_zero_rows >= 3:
+                    logger.warning(
+                        f"Candidate failed 3 consecutive times with 0 rows. "
+                        f"This suggests incompatible tables or missing JOIN keys. "
+                        f"Abandoning this candidate."
+                    )
+                    break
+            else:
+                consecutive_zero_rows = 0
             
             if is_valid:
                 # Query passed all validations!
@@ -141,12 +170,16 @@ class QueryRefiner:
             feedback = history.get_feedback_for_refinement()
             logger.info(f"Refining query with feedback: {feedback[:200]}...")
             
-            success, error_msg, refined_sql = self.gemini_client.refine_query(
+            success, error_msg, refined_sql, refine_usage = self.gemini_client.refine_query(
                 original_sql=current_sql,
                 feedback=feedback,
                 insight=insight,
                 datasets=dataset_dicts
             )
+            
+            # Track refinement token usage
+            query_refinement_tokens += refine_usage.get("total_tokens", 0)
+            query_llm_calls += 1
             
             if not success or not refined_sql:
                 logger.error(f"Failed to refine query: {error_msg}")
@@ -167,15 +200,21 @@ class QueryRefiner:
             description=description,
             history=history,
             total_time_ms=total_time_ms,
-            source_tables=source_tables
+            source_tables=source_tables,
+            target_table_name=target_table_name,
+            query_index=query_index,
+            query_refinement_tokens=query_refinement_tokens,
+            query_alignment_tokens=query_alignment_tokens,
+            query_llm_calls=query_llm_calls
         )
     
     def _run_validation_pipeline(
         self,
         sql: str,
         insight: str,
-        iter_state: IterationState
-    ) -> tuple[bool, Optional[float], Optional[Dict[str, Any]]]:
+        iter_state: IterationState,
+        datasets: List[DatasetMetadata]
+    ) -> tuple[bool, Optional[float], Optional[Dict[str, Any]], Dict[str, int]]:
         """
         Run the full validation pipeline on a query.
         
@@ -183,11 +222,13 @@ class QueryRefiner:
             sql: SQL query to validate
             insight: Original insight
             iter_state: Iteration state to update
+            datasets: Available datasets (for field description generation)
             
         Returns:
-            Tuple of (is_valid, alignment_score, validation_details)
+            Tuple of (is_valid, alignment_score, validation_details, usage_metadata)
         """
         validation_details = {}
+        empty_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         
         # Skip custom syntax validation - let BigQuery be the source of truth
         logger.info("Skipping custom syntax validation - BigQuery will validate")
@@ -199,6 +240,7 @@ class QueryRefiner:
         iter_state.current_stage = ValidationStage.DRYRUN
         dryrun_valid, dryrun_error, stats = self.dryrun_validator.validate_dryrun(sql)
         iter_state.dryrun_passed = dryrun_valid
+        iter_state.execution_stats = stats
         validation_details["dryrun_valid"] = dryrun_valid
         validation_details["execution_stats"] = stats
         
@@ -211,17 +253,31 @@ class QueryRefiner:
                 message=dryrun_error or "Query failed BigQuery validation",
                 details={"sql": sql[:500]}  # Include first 500 chars for context
             )
-            return False, None, validation_details
+            return False, None, validation_details, empty_usage
         logger.info(f"✓ BigQuery validation passed (estimated {stats.get('total_bytes_processed', 0) / (1024*1024):.2f} MB)")
         
         # Stage 2: Sample execution
         logger.info("Stage 2: Sample execution")
         iter_state.current_stage = ValidationStage.EXECUTION
-        exec_success, exec_error, sample_rows, schema = self.dryrun_validator.execute_sample(sql)
+        
+        # Extract source tables from datasets
+        source_tables = self._extract_source_tables(sql, datasets)
+        
+        exec_success, exec_error, sample_rows, schema = self.dryrun_validator.execute_sample(
+            sql, source_tables=source_tables
+        )
         iter_state.execution_passed = exec_success
+        iter_state.sample_results = sample_rows
+        iter_state.result_schema = schema
         validation_details["execution_valid"] = exec_success
         validation_details["sample_results"] = sample_rows
         validation_details["result_schema"] = schema
+        
+        # Debug logging for schema
+        if schema:
+            logger.debug(f"Schema captured with {len(schema)} fields: {[f.get('name') for f in schema]}")
+        else:
+            logger.warning("Schema is empty or None after execute_sample")
         
         if not exec_success:
             logger.warning(f"Sample execution failed: {exec_error}")
@@ -232,13 +288,43 @@ class QueryRefiner:
                 message=exec_error or "Query execution failed",
                 details={"sql": sql[:500]}
             )
-            return False, None, validation_details
+            return False, None, validation_details, empty_usage
         logger.info(f"✓ Sample execution passed ({len(sample_rows) if sample_rows else 0} rows returned)")
+        
+        # Generate field descriptions using Gemini Flash
+        if schema:
+            try:
+                logger.info("Generating field descriptions using Gemini Flash...")
+                source_datasets_dicts = self._prepare_datasets_for_descriptions(datasets)
+                field_descriptions = self.gemini_client.generate_field_descriptions(
+                    sql=sql,
+                    schema=schema,
+                    insight=insight,
+                    source_datasets=source_datasets_dicts
+                )
+                
+                # Enrich schema with descriptions
+                if field_descriptions:
+                    for field in schema:
+                        field_name = field.get("name")
+                        if field_name in field_descriptions:
+                            field["description"] = field_descriptions[field_name]
+                            logger.debug(f"Added description for field: {field_name}")
+                    
+                    # Update both iter_state and validation_details with enriched schema
+                    iter_state.result_schema = schema
+                    validation_details["result_schema"] = schema
+                    logger.info(f"✓ Generated descriptions for {len(field_descriptions)} fields")
+                else:
+                    logger.warning("No field descriptions generated")
+            except Exception as e:
+                logger.warning(f"Failed to generate field descriptions: {e}")
+                # Continue without descriptions - don't block query validation
         
         # Stage 3: Alignment validation
         logger.info("Stage 3: Alignment validation (AI checking if results match insight)")
         iter_state.current_stage = ValidationStage.ALIGNMENT
-        aligned, align_error, score, reasoning = self.alignment_validator.validate(
+        aligned, align_error, score, reasoning, align_usage = self.alignment_validator.validate(
             insight=insight,
             sql=sql,
             sample_results=sample_rows or [],
@@ -259,13 +345,13 @@ class QueryRefiner:
                 message=f"Query results don't align with insight (score: {score_str})",
                 details={"reasoning": reasoning}
             )
-            return False, score, validation_details
+            return False, score, validation_details, align_usage or empty_usage
         
         # All validations passed!
         score_str = f"{score:.2f}" if score is not None else "N/A"
         logger.info(f"✓ Alignment validation passed (score={score_str})")
         iter_state.current_stage = ValidationStage.COMPLETE
-        return True, score, validation_details
+        return True, score, validation_details, align_usage or empty_usage
     
     def _build_query_result(
         self,
@@ -273,7 +359,12 @@ class QueryRefiner:
         description: str,
         history: QueryValidationHistory,
         total_time_ms: float,
-        source_tables: List[str]
+        source_tables: List[str],
+        target_table_name: Optional[str] = None,
+        query_index: int = 0,
+        query_refinement_tokens: int = 0,
+        query_alignment_tokens: int = 0,
+        query_llm_calls: int = 0
     ) -> QueryResult:
         """
         Build final QueryResult from validation history.
@@ -284,6 +375,8 @@ class QueryRefiner:
             history: Validation history
             total_time_ms: Total time spent
             source_tables: Fully qualified table names used in query
+            target_table_name: Name of target table for query naming
+            query_index: Index of this query for unique naming
             
         Returns:
             QueryResult object
@@ -304,11 +397,18 @@ class QueryRefiner:
             alignment_reasoning=None,
             execution_stats=final_iter.execution_stats if final_iter else None,
             sample_results=final_iter.sample_results if final_iter else None,
-            result_schema=None
+            result_schema=final_iter.result_schema if final_iter else None
         )
+        
+        # Generate unique query_name
+        if target_table_name:
+            query_name = f"{target_table_name}_query_{query_index}"
+        else:
+            query_name = f"query_{query_index}"
         
         # Build QueryResult
         query_result = QueryResult(
+            query_name=query_name,
             sql=sql,
             description=description,
             source_tables=source_tables,
@@ -318,7 +418,12 @@ class QueryRefiner:
             iterations=history.total_iterations,
             generation_time_ms=total_time_ms,
             estimated_cost_usd=self._extract_cost(final_iter),
-            estimated_bytes_processed=self._extract_bytes(final_iter)
+            estimated_bytes_processed=self._extract_bytes(final_iter),
+            token_usage={
+                "refinement_tokens": query_refinement_tokens,
+                "alignment_tokens": query_alignment_tokens,
+                "llm_calls": query_llm_calls
+            } if (query_refinement_tokens + query_alignment_tokens) > 0 else None
         )
         
         return query_result
@@ -366,4 +471,44 @@ class QueryRefiner:
             "environment": dataset.environment,
             "tags": dataset.tags
         }
+    
+    def _extract_source_tables(self, sql: str, datasets: List[DatasetMetadata]) -> List[str]:
+        """
+        Extract fully qualified table names used in SQL.
+        
+        Args:
+            sql: The SQL query
+            datasets: Available datasets
+            
+        Returns:
+            List of fully qualified table IDs that appear in the SQL
+        """
+        source_tables = []
+        for dataset in datasets:
+            table_id = dataset.get_full_table_id()
+            if table_id in sql:
+                source_tables.append(table_id)
+        return source_tables
+    
+    def _prepare_datasets_for_descriptions(self, datasets: List[DatasetMetadata]) -> List[Dict[str, Any]]:
+        """
+        Prepare dataset metadata for description generation.
+        
+        Extracts source table schemas including field descriptions from data-discovery-agent.
+        The schema field contains: [{"name": "...", "type": "...", "description": "..."}]
+        
+        Args:
+            datasets: List of DatasetMetadata objects
+            
+        Returns:
+            List of dicts with table_id, description, and schema (including field descriptions)
+        """
+        return [
+            {
+                "table_id": ds.get_full_table_id(),
+                "description": ds.description,
+                "schema": ds.schema  # CRITICAL: Contains field descriptions from data-discovery-agent
+            }
+            for ds in datasets
+        ]
 

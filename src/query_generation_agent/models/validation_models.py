@@ -73,6 +73,7 @@ class IterationState(BaseModel):
     alignment_score: Optional[float] = Field(None, description="Alignment score if computed")
     sample_results: Optional[List[Dict[str, Any]]] = Field(None, description="Sample query results")
     execution_stats: Optional[Dict[str, Any]] = Field(None, description="Execution statistics")
+    result_schema: Optional[List[Dict[str, Any]]] = Field(None, description="Result schema with field descriptions")
     
     # Timing
     iteration_time_ms: float = Field(default=0.0, description="Time for this iteration", ge=0)
@@ -186,37 +187,57 @@ class QueryValidationHistory(BaseModel):
         """
         Generate feedback message for LLM refinement.
         
+        Includes full history of all attempts to prevent repeating failed approaches.
+        
         Returns:
             Formatted feedback including all errors and context
         """
-        current = self.get_current_iteration()
-        if not current:
+        if not self.iterations:
             return "No validation attempts yet"
         
         feedback_parts = [
-            f"Iteration {current.iteration_number + 1} of validation failed.",
-            f"\nCurrent SQL:\n{current.sql}\n"
+            f"Previous attempts: {len(self.iterations)}",
+            "\nHISTORY OF ATTEMPTS:\n"
         ]
         
-        # Add error feedback
-        if current.errors:
-            feedback_parts.append("\nErrors encountered:")
-            for error in current.errors:
-                feedback_parts.append(f"\n{error.get_feedback_message()}")
+        # Include full history of all iterations
+        for i, iteration in enumerate(self.iterations):
+            feedback_parts.append(f"\n=== ATTEMPT {i + 1} ===")
+            feedback_parts.append(f"SQL:\n{iteration.sql}\n")
+            
+            # Show what happened in this iteration
+            if iteration.errors:
+                feedback_parts.append("Errors:")
+                for error in iteration.errors:
+                    feedback_parts.append(f"  - {error.message}")
+            
+            # Show results
+            if iteration.sample_results is not None:
+                row_count = len(iteration.sample_results)
+                feedback_parts.append(f"Returned {row_count} rows")
+            
+            # Show alignment score if available
+            if iteration.alignment_score is not None:
+                feedback_parts.append(f"Alignment score: {iteration.alignment_score:.2f}")
+            
+            # Show which stages passed
+            stages = []
+            if iteration.syntax_passed:
+                stages.append("syntax")
+            if iteration.dryrun_passed:
+                stages.append("dryrun")
+            if iteration.execution_passed:
+                stages.append("execution")
+            if iteration.alignment_passed:
+                stages.append("alignment")
+            if stages:
+                feedback_parts.append(f"Passed stages: {', '.join(stages)}")
         
-        # Add stage-specific guidance
-        if not current.syntax_passed:
-            feedback_parts.append("\nThe SQL syntax is invalid. Please fix syntax errors.")
-        elif not current.dryrun_passed:
-            feedback_parts.append("\nThe query failed BigQuery dry-run validation. Check table/column names.")
-        elif not current.execution_passed:
-            feedback_parts.append("\nThe query failed during execution. Check for runtime errors.")
-        elif not current.alignment_passed:
-            score = current.alignment_score or 0.0
-            feedback_parts.append(
-                f"\nThe query results don't fully align with the insight (score: {score:.2f}). "
-                "Refine the query logic to better answer the question."
-            )
+        # Add guidance based on history
+        feedback_parts.append("\n\nBased on this history, generate a NEW approach that:")
+        feedback_parts.append("1. Doesn't repeat failed approaches from previous attempts")
+        feedback_parts.append("2. Learns from patterns in the errors (e.g., if all JOINs return 0 rows, try different JOIN keys)")
+        feedback_parts.append("3. Tries a genuinely different strategy, not just minor variations")
         
         return "\n".join(feedback_parts)
     

@@ -86,7 +86,8 @@ class BigQueryClient:
     def execute_with_limit(
         self,
         sql: str,
-        limit: int = 10
+        limit: int = 10,
+        source_tables: Optional[List[str]] = None
     ) -> Tuple[bool, Optional[str], Optional[List[Dict[str, Any]]], Optional[List[Dict[str, str]]]]:
         """
         Execute query with LIMIT to get sample results.
@@ -94,6 +95,7 @@ class BigQueryClient:
         Args:
             sql: SQL query to execute
             limit: Maximum number of rows to return
+            source_tables: Optional list of source table IDs (for future use)
             
         Returns:
             Tuple of (success, error_message, sample_rows, schema)
@@ -128,8 +130,22 @@ class BigQueryClient:
                         "type": field.field_type,
                         "mode": field.mode
                     })
+                logger.debug(f"Extracted schema with {len(schema)} fields")
+            else:
+                logger.warning("query_job.schema is None or empty - attempting to extract from results")
+                # Try to extract schema from the results object
+                if results.schema:
+                    for field in results.schema:
+                        schema.append({
+                            "name": field.name,
+                            "type": field.field_type,
+                            "mode": field.mode
+                        })
+                    logger.debug(f"Extracted schema from results with {len(schema)} fields")
+                else:
+                    logger.warning("No schema available from query_job or results")
             
-            logger.info(f"Query executed successfully. Returned {len(sample_rows)} rows")
+            logger.info(f"Query executed successfully. Returned {len(sample_rows)} rows, schema has {len(schema)} fields")
             return True, None, sample_rows, schema
             
         except GoogleCloudError as e:

@@ -230,10 +230,10 @@ def get_available_tools() -> list[Tool]:
                     },
                     "max_iterations": {
                         "type": "integer",
-                        "description": "Maximum refinement iterations per query (default: 10)",
+                        "description": "Maximum refinement iterations per query (default: 5)",
                         "minimum": 1,
                         "maximum": 20,
-                        "default": 10
+                        "default": 5
                     },
                     "require_alignment_check": {
                         "type": "boolean",
@@ -244,6 +244,10 @@ def get_available_tools() -> list[Tool]:
                         "type": "boolean",
                         "description": "Allow joins across datasets (default: true)",
                         "default": True
+                    },
+                    "target_table_name": {
+                        "type": "string",
+                        "description": "Name of target table/view these queries populate (used for naming)"
                     },
                     "discovery_metadata": {
                         "type": "object",

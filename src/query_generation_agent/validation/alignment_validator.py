@@ -40,7 +40,7 @@ class AlignmentValidator:
         sql: str,
         sample_results: List[Dict[str, Any]],
         result_schema: List[Dict[str, str]]
-    ) -> Tuple[bool, Optional[str], Optional[float], Optional[str]]:
+    ) -> Tuple[bool, Optional[str], Optional[float], Optional[str], Optional[Dict[str, Any]]]:
         """
         Validate alignment between query results and insight.
         
@@ -51,22 +51,29 @@ class AlignmentValidator:
             result_schema: Schema of query results
             
         Returns:
-            Tuple of (is_aligned, error_message, alignment_score, reasoning)
+            Tuple of (is_aligned, error_message, alignment_score, reasoning, usage)
         """
         # Validate inputs
         if not sample_results:
             logger.warning("No sample results provided for alignment validation")
-            return False, "No sample results to validate", 0.0, "Query returned no results"
+            return False, "No sample results to validate", 0.0, "Query returned no results", None
         
         if not result_schema:
             logger.warning("No result schema provided for alignment validation")
             # Can still proceed with validation
             result_schema = []
         
+        # Check for NULL-heavy results (potential gaming of validation)
+        null_ratio = self._calculate_null_ratio(sample_results)
+        if null_ratio > 0.5:
+            logger.warning(f"Query results contain {null_ratio*100:.1f}% NULL values")
+            return False, "Results contain too many NULL values", 0.0, \
+                   "Query returns rows but most fields are NULL. This suggests incorrect JOINs or data issues.", None
+        
         logger.debug(f"Validating alignment for insight: {insight[:100]}...")
         
         # Call Gemini for alignment validation
-        success, error_msg, score, reasoning = self.gemini_client.validate_alignment(
+        success, error_msg, score, reasoning, usage = self.gemini_client.validate_alignment(
             insight=insight,
             sql=sql,
             sample_results=sample_results,
@@ -75,7 +82,7 @@ class AlignmentValidator:
         
         if not success:
             logger.error(f"Alignment validation failed: {error_msg}")
-            return False, error_msg, None, None
+            return False, error_msg, None, None, None
         
         # Check if score meets threshold
         is_aligned = score >= self.alignment_threshold
@@ -87,7 +94,7 @@ class AlignmentValidator:
                 f"Alignment validation failed. Score: {score:.2f} below threshold {self.alignment_threshold}"
             )
         
-        return is_aligned, None, score, reasoning
+        return is_aligned, None, score, reasoning, usage
     
     def validate_with_feedback(
         self,
@@ -108,7 +115,7 @@ class AlignmentValidator:
         Returns:
             Tuple of (is_aligned, error_message, alignment_score, reasoning, feedback)
         """
-        is_aligned, error_msg, score, reasoning = self.validate(
+        is_aligned, error_msg, score, reasoning, _ = self.validate(
             insight, sql, sample_results, result_schema
         )
         
@@ -210,7 +217,7 @@ class AlignmentValidator:
             True if aligned (score >= threshold)
         """
         # Use empty schema for quick validation
-        is_aligned, _, _, _ = self.validate(
+        is_aligned, _, _, _, _ = self.validate(
             insight=insight,
             sql=sql,
             sample_results=sample_results,
@@ -218,4 +225,31 @@ class AlignmentValidator:
         )
         
         return is_aligned
+    
+    def _calculate_null_ratio(self, sample_results: List[Dict[str, Any]]) -> float:
+        """
+        Calculate ratio of NULL values in sample results.
+        
+        Used to detect queries that return rows but with mostly NULL values,
+        which can indicate incorrect JOINs or attempts to game validation.
+        
+        Args:
+            sample_results: Sample rows from query execution
+            
+        Returns:
+            Ratio of NULL values (0.0 to 1.0)
+        """
+        if not sample_results:
+            return 1.0
+        
+        total_values = 0
+        null_values = 0
+        
+        for row in sample_results:
+            for value in row.values():
+                total_values += 1
+                if value is None:
+                    null_values += 1
+        
+        return null_values / total_values if total_values > 0 else 1.0
 

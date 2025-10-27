@@ -58,7 +58,7 @@ class GeminiClient:
         insight: str,
         datasets: List[Dict[str, Any]],
         num_queries: int = 3
-    ) -> Tuple[bool, Optional[str], Optional[List[Dict[str, str]]]]:
+    ) -> Tuple[bool, Optional[str], Optional[List[Dict[str, str]]], Dict[str, int]]:
         """
         Generate multiple SQL query candidates for an insight.
         
@@ -68,8 +68,10 @@ class GeminiClient:
             num_queries: Number of queries to generate
             
         Returns:
-            Tuple of (success, error_message, list of query dicts)
+            Tuple of (success, error_message, list of query dicts, usage_metadata)
         """
+        empty_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        
         try:
             prompt = self._build_generation_prompt(insight, datasets, num_queries)
             
@@ -80,10 +82,10 @@ class GeminiClient:
             logger.debug(prompt)
             logger.debug("=" * 80)
             
-            response = self._call_with_retry(prompt, json_mode=True)
+            response, usage = self._call_with_retry(prompt, json_mode=True)
             
             if not response:
-                return False, "Failed to get response from Gemini", None
+                return False, "Failed to get response from Gemini", None, usage
             
             # Parse JSON response
             try:
@@ -91,19 +93,19 @@ class GeminiClient:
                 queries = queries_data.get("queries", [])
                 
                 if not queries:
-                    return False, "No queries returned from Gemini", None
+                    return False, "No queries returned from Gemini", None, usage
                 
                 logger.info(f"Successfully generated {len(queries)} queries")
-                return True, None, queries
+                return True, None, queries, usage
                 
             except json.JSONDecodeError as e:
                 logger.error(f"Failed to parse JSON response: {e}")
-                return False, f"Invalid JSON response: {str(e)}", None
+                return False, f"Invalid JSON response: {str(e)}", None, usage
                 
         except Exception as e:
             error_msg = f"Error generating queries: {str(e)}"
             logger.error(error_msg, exc_info=True)
-            return False, error_msg, None
+            return False, error_msg, None, empty_usage
     
     def refine_query(
         self,
@@ -111,7 +113,7 @@ class GeminiClient:
         feedback: str,
         insight: str,
         datasets: List[Dict[str, Any]]
-    ) -> Tuple[bool, Optional[str], Optional[str]]:
+    ) -> Tuple[bool, Optional[str], Optional[str], Dict[str, int]]:
         """
         Refine a query based on validation feedback.
         
@@ -122,8 +124,10 @@ class GeminiClient:
             datasets: Dataset metadata
             
         Returns:
-            Tuple of (success, error_message, refined_sql)
+            Tuple of (success, error_message, refined_sql, usage_metadata)
         """
+        empty_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        
         try:
             prompt = self._build_refinement_prompt(original_sql, feedback, insight, datasets)
             
@@ -134,10 +138,10 @@ class GeminiClient:
             logger.debug(prompt)
             logger.debug("=" * 80)
             
-            response = self._call_with_retry(prompt, json_mode=True)
+            response, usage = self._call_with_retry(prompt, json_mode=True)
             
             if not response:
-                return False, "Failed to get response from Gemini", None
+                return False, "Failed to get response from Gemini", None, usage
             
             # Parse JSON response
             try:
@@ -146,19 +150,19 @@ class GeminiClient:
                 reasoning = refinement_data.get("reasoning", "")
                 
                 if not refined_sql:
-                    return False, "No refined SQL returned", None
+                    return False, "No refined SQL returned", None, usage
                 
                 logger.info(f"Query refined successfully. Reasoning: {reasoning[:100]}")
-                return True, None, refined_sql
+                return True, None, refined_sql, usage
                 
             except json.JSONDecodeError as e:
                 logger.error(f"Failed to parse JSON response: {e}")
-                return False, f"Invalid JSON response: {str(e)}", None
+                return False, f"Invalid JSON response: {str(e)}", None, usage
                 
         except Exception as e:
             error_msg = f"Error refining query: {str(e)}"
             logger.error(error_msg, exc_info=True)
-            return False, error_msg, None
+            return False, error_msg, None, empty_usage
     
     def validate_alignment(
         self,
@@ -166,7 +170,7 @@ class GeminiClient:
         sql: str,
         sample_results: List[Dict[str, Any]],
         schema: List[Dict[str, str]]
-    ) -> Tuple[bool, Optional[str], Optional[float], Optional[str]]:
+    ) -> Tuple[bool, Optional[str], Optional[float], Optional[str], Dict[str, int]]:
         """
         Validate if query results align with the insight intent.
         
@@ -177,8 +181,10 @@ class GeminiClient:
             schema: Result schema
             
         Returns:
-            Tuple of (success, error_message, alignment_score, reasoning)
+            Tuple of (success, error_message, alignment_score, reasoning, usage_metadata)
         """
+        empty_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        
         try:
             prompt = self._build_alignment_prompt(insight, sql, sample_results, schema)
             
@@ -189,10 +195,10 @@ class GeminiClient:
             logger.debug(prompt)
             logger.debug("=" * 80)
             
-            response = self._call_with_retry(prompt, json_mode=True)
+            response, usage = self._call_with_retry(prompt, json_mode=True)
             
             if not response:
-                return False, "Failed to get response from Gemini", None, None
+                return False, "Failed to get response from Gemini", None, None, usage
             
             # Parse JSON response
             try:
@@ -202,18 +208,18 @@ class GeminiClient:
                 aligned = alignment_data.get("aligned", False)
                 
                 logger.info(f"Alignment validation: score={score:.2f}, aligned={aligned}")
-                return True, None, score, reasoning
+                return True, None, score, reasoning, usage
                 
             except json.JSONDecodeError as e:
                 logger.error(f"Failed to parse JSON response: {e}")
-                return False, f"Invalid JSON response: {str(e)}", None, None
+                return False, f"Invalid JSON response: {str(e)}", None, None, usage
                 
         except Exception as e:
             error_msg = f"Error validating alignment: {str(e)}"
             logger.error(error_msg, exc_info=True)
-            return False, error_msg, None, None
+            return False, error_msg, None, None, empty_usage
     
-    def _call_with_retry(self, prompt: str, json_mode: bool = False) -> Optional[str]:
+    def _call_with_retry(self, prompt: str, json_mode: bool = False) -> Tuple[Optional[str], Dict[str, int]]:
         """
         Call Gemini API with retry logic.
         
@@ -222,7 +228,8 @@ class GeminiClient:
             json_mode: Whether to request JSON output
             
         Returns:
-            Response text or None if all retries failed
+            Tuple of (response_text, usage_metadata)
+            usage_metadata contains: prompt_tokens, completion_tokens, total_tokens
         """
         generation_config = GenerationConfig(
             temperature=self.temperature,
@@ -236,6 +243,16 @@ class GeminiClient:
                     generation_config=generation_config
                 )
                 
+                # Extract usage metadata
+                usage = {
+                    "prompt_tokens": response.usage_metadata.prompt_token_count,
+                    "completion_tokens": response.usage_metadata.candidates_token_count,
+                    "total_tokens": response.usage_metadata.total_token_count
+                }
+                
+                logger.debug(f"Token usage: {usage['total_tokens']} total "
+                           f"({usage['prompt_tokens']} prompt + {usage['completion_tokens']} completion)")
+                
                 # Log the response for debugging
                 logger.debug("=" * 80)
                 logger.debug("LLM RESPONSE:")
@@ -243,7 +260,7 @@ class GeminiClient:
                 logger.debug(response.text)
                 logger.debug("=" * 80)
                 
-                return response.text
+                return response.text, usage
                 
             except Exception as e:
                 logger.warning(f"Gemini API call failed (attempt {attempt + 1}/{self.max_retries}): {e}")
@@ -255,9 +272,9 @@ class GeminiClient:
                     time.sleep(sleep_time)
                 else:
                     logger.error("All retry attempts failed")
-                    return None
+                    return None, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         
-        return None
+        return None, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     
     def _build_generation_prompt(
         self,
@@ -293,21 +310,42 @@ INSIGHT:
 AVAILABLE DATASETS:
 {datasets_text}
 
-REQUIREMENTS:
-1. Generate exactly {num_queries} distinct queries that answer the insight from different angles or with different approaches
-2. Use only the tables and columns shown above
-3. Write valid BigQuery SQL (use backticks for table/column names with special chars)
-4. Include appropriate aggregations, filters, and GROUP BY clauses as needed
-5. Optimize for correctness and clarity over performance
+STRATEGY FOR GENERATING {num_queries} DIVERSE QUERIES:
+Generate queries with FUNDAMENTALLY DIFFERENT approaches, not just variations. Each query should:
+- Use DIFFERENT JOIN strategies (e.g., Query 1: simple JOIN, Query 2: use CTEs with aggregations, Query 3: different table combinations)
+- Make DIFFERENT assumptions about data relationships (e.g., JOIN on different key combinations)
+- Have DIFFERENT levels of complexity (e.g., Query 1: simplest possible, Query 2: moderate, Query 3: comprehensive)
+
+This diversity ensures that if one approach fails (e.g., JOIN keys don't exist), other approaches might still succeed.
+
+CRITICAL REQUIREMENTS:
+1. Generate exactly {num_queries} FUNDAMENTALLY distinct queries using different strategies
+2. Use ONLY tables and columns shown above - verify column names exist in schemas
+3. EXAMINE SAMPLE VALUES to understand:
+   - What JOIN keys might actually work (look for similar value patterns)
+   - What values exist in columns (don't filter on values that don't appear in samples)
+   - What data types are used (ensure JOIN keys have compatible types)
+4. Write valid BigQuery SQL (use backticks for table/column names with special chars)
+5. ENSURE queries return actual data, not NULL values:
+   - Verify JOINs will match actual rows based on sample values
+   - Filter for non-NULL key fields (e.g., WHERE actual_spread IS NOT NULL)
+   - Don't explicitly set columns to NULL
 6. Each query should be self-contained and executable
-7. Include a brief description of what each query does
+7. Optimize for CORRECTNESS first - a simple query that returns real data beats a complex query with NULLs
+
+QUALITY CHECKS FOR EACH QUERY:
+Before finalizing each query, verify:
+- Does this query use DIFFERENT tables or JOIN logic than the others?
+- Based on sample values, will this JOIN actually match rows?
+- Are the key fields in my WHERE/JOIN conditions actually present in the schemas?
+- Will this return meaningful data (not just NULLs)?
 
 OUTPUT FORMAT (JSON):
 {{
     "queries": [
         {{
             "sql": "SELECT ...",
-            "description": "Brief description of what this query calculates"
+            "description": "Brief description: [approach used, what makes this different from other queries]"
         }},
         ...
     ]
@@ -412,14 +450,15 @@ EVALUATION CRITERIA:
 2. Does it apply the right filters and groupings?
 3. Do the result columns match what's needed to answer the insight?
 4. Are the sample results reasonable and consistent with the insight?
-5. Would a data scientist find this query useful for the stated insight?
+5. Are key fields populated with real data (not NULL values)?
+6. Would a data scientist find this query useful for the stated insight?
 
 SCORING:
-- 1.0: Perfect alignment - query fully answers the insight
+- 1.0: Perfect alignment - query fully answers the insight with real, non-NULL data
 - 0.8-0.9: Good alignment - query answers most of the insight with minor gaps
 - 0.6-0.7: Partial alignment - query is related but misses key aspects
 - 0.4-0.5: Weak alignment - query is loosely related
-- 0.0-0.3: Poor alignment - query doesn't answer the insight
+- 0.0-0.3: Poor alignment - query doesn't answer the insight OR returns mostly NULL values
 
 OUTPUT FORMAT (JSON):
 {{
@@ -486,4 +525,148 @@ Provide your evaluation now:"""
             error_msg = f"Error generating VIEW DDL: {str(e)}"
             logger.error(error_msg, exc_info=True)
             return False, error_msg, ""
+    
+    def generate_field_descriptions(
+        self,
+        sql: str,
+        schema: List[Dict[str, str]],
+        insight: str,
+        source_datasets: List[Dict[str, Any]]
+    ) -> Dict[str, str]:
+        """
+        Generate semantic descriptions for query output fields using Gemini Flash.
+        
+        Leverages existing field descriptions from source table schemas (provided by
+        data-discovery-agent) and the SQL query logic to generate clear, concise 
+        descriptions for each output field.
+        
+        Args:
+            sql: The SQL query
+            schema: Basic field schema (name, type, mode) from BigQuery execution
+            insight: Original user insight/question
+            source_datasets: Source datasets with schema descriptions from data-discovery-agent
+                            Each dataset has: {"table_id": "...", "description": "...", 
+                            "schema": [{"name": "...", "type": "...", "description": "..."}]}
+            
+        Returns:
+            Dictionary mapping field names to descriptions
+        """
+        try:
+            # Build prompt for field description generation
+            prompt = self._build_field_description_prompt(sql, schema, insight, source_datasets)
+            
+            logger.debug("Generating field descriptions using Gemini Flash")
+            logger.debug("=" * 80)
+            logger.debug("LLM CONTEXT - FIELD DESCRIPTION GENERATION:")
+            logger.debug("-" * 80)
+            logger.debug(prompt)
+            logger.debug("=" * 80)
+            
+            # Use Flash model for speed and cost efficiency
+            flash_model = genai.GenerativeModel("gemini-flash-latest")
+            
+            response = flash_model.generate_content(
+                prompt,
+                generation_config=GenerationConfig(
+                    temperature=0.2,
+                    response_mime_type="application/json"
+                )
+            )
+            
+            if not response or not response.text:
+                logger.warning("No response from Gemini for field descriptions")
+                return {}
+            
+            # Parse JSON response
+            try:
+                descriptions = json.loads(response.text)
+                
+                if not isinstance(descriptions, dict):
+                    logger.warning(f"Expected dict from Gemini, got {type(descriptions)}")
+                    return {}
+                
+                logger.info(f"Successfully generated {len(descriptions)} field descriptions")
+                return descriptions
+                
+            except json.JSONDecodeError as e:
+                logger.warning(f"Failed to parse field descriptions JSON: {e}")
+                logger.debug(f"Response text: {response.text[:500]}")
+                return {}
+                
+        except Exception as e:
+            logger.warning(f"Error generating field descriptions: {e}")
+            return {}
+    
+    def _build_field_description_prompt(
+        self,
+        sql: str,
+        schema: List[Dict[str, str]],
+        insight: str,
+        source_datasets: List[Dict[str, Any]]
+    ) -> str:
+        """
+        Build prompt for field description generation.
+        
+        Args:
+            sql: The SQL query
+            schema: Basic field schema
+            insight: Original user insight
+            source_datasets: Source datasets with schema descriptions
+            
+        Returns:
+            Formatted prompt string
+        """
+        # Extract field names from schema
+        field_names = [field.get("name") for field in schema if field.get("name")]
+        
+        # Build source table schema section
+        source_schema_text = ""
+        for ds in source_datasets:
+            table_id = ds.get("table_id", "unknown")
+            source_schema_text += f"\nTable: {table_id}\n"
+            
+            if ds.get("description"):
+                source_schema_text += f"Description: {ds['description']}\n"
+            
+            source_schema_text += "Fields:\n"
+            for field in ds.get("schema", []):
+                field_name = field.get("name", "unknown")
+                field_type = field.get("type", "unknown")
+                field_desc = field.get("description", "")
+                
+                if field_desc:
+                    source_schema_text += f"  - {field_name} ({field_type}): {field_desc}\n"
+                else:
+                    source_schema_text += f"  - {field_name} ({field_type})\n"
+        
+        # Build output field list
+        output_fields_text = "\n".join([f"- {name}" for name in field_names])
+        
+        prompt = f"""Generate concise field descriptions for a SQL query's output fields.
+
+USER QUESTION:
+{insight}
+
+SQL QUERY:
+{sql}
+
+SOURCE TABLE SCHEMAS:
+{source_schema_text}
+
+OUTPUT FIELDS NEEDING DESCRIPTIONS:
+{output_fields_text}
+
+INSTRUCTIONS:
+- For direct column references from source tables, use or adapt the source field description
+- For calculated fields (CASE WHEN, arithmetic operations), explain the calculation based on the SQL expression
+- For aggregated fields (SUM, COUNT, AVG, etc.), describe the aggregation and what it represents
+- For derived fields, explain the calculation using source field descriptions as context
+- Keep each description concise (1-2 sentences maximum)
+- Focus on what the field represents in the context of answering the user's question
+
+Return ONLY valid JSON with field names as keys and descriptions as values:
+{{"field_name": "Clear, concise description here", ...}}
+"""
+        
+        return prompt
 

@@ -75,12 +75,29 @@ class ValidationResult(BaseModel):
         }
 
 
+class TokenUsage(BaseModel):
+    """Token usage statistics for LLM API calls."""
+    
+    prompt_tokens: int = Field(0, description="Total input tokens", ge=0)
+    completion_tokens: int = Field(0, description="Total output tokens", ge=0)
+    total_tokens: int = Field(0, description="Total tokens (prompt + completion)", ge=0)
+    
+    generation_tokens: int = Field(0, description="Tokens used for initial query generation", ge=0)
+    refinement_tokens: int = Field(0, description="Tokens used for query refinement", ge=0)
+    alignment_tokens: int = Field(0, description="Tokens used for alignment validation", ge=0)
+    
+    llm_calls: int = Field(0, description="Total number of LLM API calls", ge=0)
+
+
 class QueryResult(BaseModel):
     """
     A single generated and validated query result.
     
     Contains the SQL query, description, validation status, and metadata.
     """
+    
+    # Query identifier
+    query_name: str = Field(..., description="Unique query identifier in snake_case")
     
     # Query
     sql: str = Field(..., description="The BigQuery SQL query")
@@ -112,6 +129,12 @@ class QueryResult(BaseModel):
     # Optional fields
     estimated_cost_usd: Optional[float] = Field(None, description="Estimated execution cost")
     estimated_bytes_processed: Optional[int] = Field(None, description="Estimated bytes processed")
+    
+    # Token usage tracking (per-query refinement and alignment only)
+    token_usage: Optional[Dict[str, int]] = Field(
+        None,
+        description="Token usage for this query (refinement + alignment LLM calls)"
+    )
     
     def is_valid(self) -> bool:
         """
@@ -180,6 +203,9 @@ class GenerateQueriesResponse(BaseModel):
     Contains array of query results with metadata about the generation process.
     """
     
+    # Project identification
+    project_name: Optional[str] = Field(None, description="Project name derived from target table")
+    
     # Results
     queries: List[QueryResult] = Field(
         default_factory=list,
@@ -198,6 +224,18 @@ class GenerateQueriesResponse(BaseModel):
     # Optional summary
     summary: Optional[str] = Field(None, description="Human-readable summary")
     warnings: List[str] = Field(default_factory=list, description="Warnings during generation")
+    
+    # Token usage tracking
+    token_usage: Optional[TokenUsage] = Field(
+        None, 
+        description="Token usage statistics and LLM call counts"
+    )
+    
+    # Failure diagnostic (only present when all queries fail)
+    failure_diagnostic: Optional[str] = Field(
+        None, 
+        description="Markdown-formatted diagnostic report when all queries fail"
+    )
     
     def get_valid_queries(self) -> List[QueryResult]:
         """
@@ -239,6 +277,10 @@ class GenerateQueriesResponse(BaseModel):
             lines.append(f"\nWarnings: {len(self.warnings)}")
             for warning in self.warnings:
                 lines.append(f"  - {warning}")
+        
+        # Add failure diagnostic if present
+        if self.failure_diagnostic:
+            lines.append("\n" + self.failure_diagnostic)
         
         valid_queries = self.get_valid_queries()
         if valid_queries:

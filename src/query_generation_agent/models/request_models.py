@@ -255,6 +255,11 @@ class GenerateQueriesRequest(BaseModel):
         description="Allow joins across datasets"
     )
     
+    target_table_name: Optional[str] = Field(
+        default=None,
+        description="Name of target table/view for query naming"
+    )
+    
     def get_datasets_summary(self) -> str:
         """
         Get summary of all datasets in the request.

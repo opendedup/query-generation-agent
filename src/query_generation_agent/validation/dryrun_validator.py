@@ -55,13 +55,15 @@ class DryRunValidator:
     
     def execute_sample(
         self,
-        sql: str
+        sql: str,
+        source_tables: Optional[List[str]] = None
     ) -> Tuple[bool, Optional[str], Optional[List[Dict[str, Any]]], Optional[List[Dict[str, str]]]]:
         """
         Execute query with LIMIT to get sample results.
         
         Args:
             sql: SQL query to execute
+            source_tables: Optional list of source table IDs
             
         Returns:
             Tuple of (success, error_message, sample_rows, result_schema)
@@ -70,7 +72,8 @@ class DryRunValidator:
         
         success, error_msg, sample_rows, schema = self.bigquery_client.execute_with_limit(
             sql,
-            limit=self.max_sample_rows
+            limit=self.max_sample_rows,
+            source_tables=source_tables
         )
         
         if success:
