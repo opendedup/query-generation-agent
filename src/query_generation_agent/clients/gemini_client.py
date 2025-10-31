@@ -290,14 +290,21 @@ class GeminiClient:
             table_id = f"{ds['project_id']}.{ds['dataset_id']}.{ds['table_id']}"
             schema_text = self._format_schema(ds.get("schema_fields", []))
             
+            # Handle None values for optional fields
+            row_count = ds.get('row_count')
+            row_count_str = f"{row_count:,}" if row_count is not None else "unknown"
+            
+            full_markdown = ds.get('full_markdown') or '(no documentation)'
+            doc_excerpt = full_markdown[:500] if len(full_markdown) > 500 else full_markdown
+            
             dataset_info.append(f"""
 Table: `{table_id}`
-Rows: {ds.get('row_count', 'unknown'):,}
+Rows: {row_count_str}
 Schema:
 {schema_text}
 
 Documentation excerpt:
-{ds.get('full_markdown', '')[:500]}...
+{doc_excerpt}...
 """)
         
         datasets_text = "\n---\n".join(dataset_info)
@@ -326,12 +333,22 @@ CRITICAL REQUIREMENTS:
    - What values exist in columns (don't filter on values that don't appear in samples)
    - What data types are used (ensure JOIN keys have compatible types)
 4. Write valid BigQuery SQL (use backticks for table/column names with special chars)
-5. ENSURE queries return actual data, not NULL values:
+5. STRING LITERALS - BigQuery Syntax Rules:
+   - Use DOUBLE QUOTES for strings containing apostrophes
+   - Examples:
+     ✅ CORRECT: WHERE company_name = "O'Reilly Media"
+     ✅ CORRECT: WHERE status = "Customer's Choice"
+     ✅ CORRECT: WHERE category = "Director's Cut"
+     ❌ WRONG: WHERE company_name = 'O''Reilly Media'
+   - For simple strings without apostrophes, single quotes are fine:
+     ✅ CORRECT: WHERE status = 'active'
+     ✅ CORRECT: WHERE region = 'US-WEST'
+6. ENSURE queries return actual data, not NULL values:
    - Verify JOINs will match actual rows based on sample values
-   - Filter for non-NULL key fields (e.g., WHERE actual_spread IS NOT NULL)
+   - Filter for non-NULL key fields (e.g., WHERE order_id IS NOT NULL)
    - Don't explicitly set columns to NULL
-6. Each query should be self-contained and executable
-7. Optimize for CORRECTNESS first - a simple query that returns real data beats a complex query with NULLs
+7. Each query should be self-contained and executable
+8. Optimize for CORRECTNESS first - a simple query that returns real data beats a complex query with NULLs
 
 QUALITY CHECKS FOR EACH QUERY:
 Before finalizing each query, verify:
@@ -400,7 +417,11 @@ REQUIREMENTS:
 2. Fix all identified errors (syntax, schema, logic)
 3. Ensure the query still answers the original insight
 4. Use valid BigQuery SQL syntax
-5. Use only tables and columns that exist in the schemas above
+5. STRING LITERALS: Use double quotes for strings containing apostrophes
+   - Example: "O'Reilly Media" not 'O''Reilly Media'
+   - For simple strings: 'active' or 'completed' is fine
+6. Use only tables and columns that exist in the schemas above
+7. Follow BigQuery best practices for readability and performance
 
 OUTPUT FORMAT (JSON):
 {{

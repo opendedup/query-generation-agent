@@ -22,13 +22,13 @@ COPY README.md ./
 
 # Install dependencies
 RUN poetry config virtualenvs.create false \
-    && poetry install --no-dev --no-root
+    && poetry install --only main --no-root
 
 # Copy source code
 COPY src ./src
 
 # Install the package
-RUN poetry install --no-dev
+RUN poetry install --only main
 
 # ============================================================================
 # Production stage
@@ -62,7 +62,7 @@ EXPOSE 8081
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8081/health || exit 1
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8081/health').read()" || exit 1
 
 # Default to HTTP transport (controlled by MCP_TRANSPORT env var)
 # Set MCP_TRANSPORT=stdio to run stdio server instead

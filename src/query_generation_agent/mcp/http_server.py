@@ -12,12 +12,20 @@ from typing import Any, AsyncGenerator, Dict, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from jsonschema import validate, ValidationError as JsonSchemaValidationError
 
 from ..clients.bigquery_client import BigQueryClient
 from ..clients.gemini_client import GeminiClient
 from .auth import AuthenticationMiddleware
 from .config import QueryGenerationConfig, load_config
 from .handlers import MCPHandlers
+from .jsonrpc import (
+    JsonRpcErrorCode,
+    create_jsonrpc_error_response,
+    create_jsonrpc_success_response,
+    create_validation_error_response,
+    parse_jsonrpc_request,
+)
 from .tools import get_available_tools
 
 # Configure logging
@@ -62,6 +70,9 @@ def create_http_app() -> FastAPI:
             
             # Set logging level
             logging.getLogger().setLevel(config_instance.log_level)
+            
+            # Suppress verbose SQLFluff logging
+            logging.getLogger('sqlfluff').setLevel(logging.WARNING)
             
             # Initialize authentication middleware
             logger.info("Initializing authentication middleware...")
@@ -237,32 +248,101 @@ def create_http_app() -> FastAPI:
             raise HTTPException(status_code=500, detail=str(e))
     
     @app.post("/mcp/call-tool", dependencies=[Depends(verify_auth)])
-    async def call_tool(request: Request) -> Dict[str, Any]:
+    async def call_tool(request: Request) -> JSONResponse:
         """
-        Execute an MCP tool.
+        Execute an MCP tool via JSON-RPC 2.0.
         
-        Request body:
+        Request body (JSON-RPC 2.0):
             {
-                "name": "tool_name",
-                "arguments": {...}
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {
+                    "name": "tool_name",
+                    "arguments": {...}
+                },
+                "id": 1
             }
         
         Returns:
-            Tool execution results
+            JSON-RPC 2.0 response (always HTTP 200)
         """
         if not handlers_instance:
-            raise HTTPException(status_code=503, detail="MCP server not initialized")
+            return JSONResponse(
+                content=create_jsonrpc_error_response(
+                    code=JsonRpcErrorCode.SERVER_NOT_INITIALIZED,
+                    message="MCP server not initialized",
+                    request_id=None
+                )
+            )
+        
+        request_id = None
         
         try:
             body = await request.json()
             
-            tool_name = body.get("name")
-            arguments = body.get("arguments", {})
+            # Parse JSON-RPC request
+            try:
+                method, params, request_id = parse_jsonrpc_request(body)
+            except ValueError as e:
+                # Return the JSON-RPC error from parse_jsonrpc_request
+                return JSONResponse(content=e.args[0])
+            
+            # Verify method is tools/call
+            if method != "tools/call":
+                return JSONResponse(
+                    content=create_jsonrpc_error_response(
+                        code=JsonRpcErrorCode.METHOD_NOT_FOUND,
+                        message=f"Method not found: {method}",
+                        request_id=request_id
+                    )
+                )
+            
+            # Extract tool name and arguments from params
+            tool_name = params.get("name")
+            arguments = params.get("arguments", {})
             
             if not tool_name:
-                raise HTTPException(status_code=400, detail="Missing 'name' in request")
+                return JSONResponse(
+                    content=create_jsonrpc_error_response(
+                        code=JsonRpcErrorCode.INVALID_PARAMS,
+                        message="Missing 'name' parameter",
+                        request_id=request_id
+                    )
+                )
             
-            logger.info(f"Tool called via HTTP: {tool_name}")
+            # Get tool definition for schema validation
+            tools = get_available_tools()
+            tool_def = next((t for t in tools if t.name == tool_name), None)
+            
+            if not tool_def:
+                return JSONResponse(
+                    content=create_jsonrpc_error_response(
+                        code=JsonRpcErrorCode.METHOD_NOT_FOUND,
+                        message=f"Unknown tool: {tool_name}",
+                        request_id=request_id
+                    )
+                )
+            
+            # Validate arguments against tool's input schema
+            try:
+                validate(instance=arguments, schema=tool_def.inputSchema)
+            except JsonSchemaValidationError as e:
+                # Build a detailed error message
+                error_path = " -> ".join(str(p) for p in e.path) if e.path else "root"
+                
+                logger.warning(f"Input validation failed for {tool_name}: {e.message}")
+                
+                return JSONResponse(
+                    content=create_validation_error_response(
+                        validator=e.validator,
+                        message=e.message,
+                        path=error_path,
+                        validator_value=e.validator_value,
+                        request_id=request_id
+                    )
+                )
+            
+            logger.info(f"Tool called via JSON-RPC: {tool_name}")
             
             # Call tool handler
             from .tools import GENERATE_QUERIES_TOOL, GENERATE_VIEWS_TOOL
@@ -272,56 +352,157 @@ def create_http_app() -> FastAPI:
             elif tool_name == GENERATE_VIEWS_TOOL:
                 result = await handlers_instance.handle_generate_views(arguments)
             else:
-                raise HTTPException(status_code=404, detail=f"Unknown tool: {tool_name}")
+                return JSONResponse(
+                    content=create_jsonrpc_error_response(
+                        code=JsonRpcErrorCode.METHOD_NOT_FOUND,
+                        message=f"Unknown tool: {tool_name}",
+                        request_id=request_id
+                    )
+                )
             
-            # Extract text from TextContent
+            # Extract text from TextContent and parse result
             if result and len(result) > 0:
                 import json
                 response_text = result[0].text
                 response_data = json.loads(response_text)
-                return response_data
+                
+                # Return JSON-RPC success response
+                return JSONResponse(
+                    content=create_jsonrpc_success_response(
+                        result=response_data,
+                        request_id=request_id
+                    )
+                )
             else:
-                return {"error": "No response from tool"}
+                return JSONResponse(
+                    content=create_jsonrpc_error_response(
+                        code=JsonRpcErrorCode.INTERNAL_ERROR,
+                        message="No response from tool",
+                        request_id=request_id
+                    )
+                )
             
-        except HTTPException:
-            raise
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON parse error: {e}")
+            return JSONResponse(
+                content=create_jsonrpc_error_response(
+                    code=JsonRpcErrorCode.PARSE_ERROR,
+                    message=f"Parse error: {str(e)}",
+                    request_id=None
+                )
+            )
         except Exception as e:
             logger.error(f"Error calling tool: {e}", exc_info=True)
-            raise HTTPException(status_code=500, detail=str(e))
+            return JSONResponse(
+                content=create_jsonrpc_error_response(
+                    code=JsonRpcErrorCode.INTERNAL_ERROR,
+                    message=str(e),
+                    request_id=request_id
+                )
+            )
     
     @app.post("/mcp/call-tool-async", dependencies=[Depends(verify_auth)])
     async def call_tool_async(request: Request) -> JSONResponse:
         """
-        Execute an MCP tool asynchronously.
+        Execute an MCP tool asynchronously via JSON-RPC 2.0.
         
         Returns task ID immediately for long-running operations.
         Client polls status endpoint to check progress.
         
-        Request body:
+        Request body (JSON-RPC 2.0):
             {
-                "name": "tool_name",
-                "arguments": {...}
+                "jsonrpc": "2.0",
+                "method": "tools/call_async",
+                "params": {
+                    "name": "tool_name",
+                    "arguments": {...}
+                },
+                "id": 1
             }
         
         Returns:
-            202 Accepted with task_id and status URLs
+            JSON-RPC 2.0 response with task details (always HTTP 200)
         """
         if not handlers_instance or not task_manager_instance:
-            raise HTTPException(status_code=503, detail="MCP server not initialized")
+            return JSONResponse(
+                content=create_jsonrpc_error_response(
+                    code=JsonRpcErrorCode.SERVER_NOT_INITIALIZED,
+                    message="MCP server not initialized",
+                    request_id=None
+                )
+            )
+        
+        request_id = None
         
         try:
             body = await request.json()
             
-            tool_name = body.get("name")
-            arguments = body.get("arguments", {})
+            # Parse JSON-RPC request
+            try:
+                method, params, request_id = parse_jsonrpc_request(body)
+            except ValueError as e:
+                # Return the JSON-RPC error from parse_jsonrpc_request
+                return JSONResponse(content=e.args[0])
+            
+            # Verify method is tools/call_async
+            if method != "tools/call_async":
+                return JSONResponse(
+                    content=create_jsonrpc_error_response(
+                        code=JsonRpcErrorCode.METHOD_NOT_FOUND,
+                        message=f"Method not found: {method}",
+                        request_id=request_id
+                    )
+                )
+            
+            # Extract tool name and arguments from params
+            tool_name = params.get("name")
+            arguments = params.get("arguments", {})
             
             if not tool_name:
-                raise HTTPException(status_code=400, detail="Missing 'name' in request")
+                return JSONResponse(
+                    content=create_jsonrpc_error_response(
+                        code=JsonRpcErrorCode.INVALID_PARAMS,
+                        message="Missing 'name' parameter",
+                        request_id=request_id
+                    )
+                )
+            
+            # Get tool definition for schema validation
+            tools = get_available_tools()
+            tool_def = next((t for t in tools if t.name == tool_name), None)
+            
+            if not tool_def:
+                return JSONResponse(
+                    content=create_jsonrpc_error_response(
+                        code=JsonRpcErrorCode.METHOD_NOT_FOUND,
+                        message=f"Unknown tool: {tool_name}",
+                        request_id=request_id
+                    )
+                )
+            
+            # Validate arguments against tool's input schema
+            try:
+                validate(instance=arguments, schema=tool_def.inputSchema)
+            except JsonSchemaValidationError as e:
+                # Build a detailed error message
+                error_path = " -> ".join(str(p) for p in e.path) if e.path else "root"
+                
+                logger.warning(f"Input validation failed for {tool_name}: {e.message}")
+                
+                return JSONResponse(
+                    content=create_validation_error_response(
+                        validator=e.validator,
+                        message=e.message,
+                        path=error_path,
+                        validator_value=e.validator_value,
+                        request_id=request_id
+                    )
+                )
             
             # Generate task ID
             task_id = str(uuid.uuid4())
             
-            logger.info(f"Async tool called via HTTP: {tool_name}, task_id: {task_id}")
+            logger.info(f"Async tool called via JSON-RPC: {tool_name}, task_id: {task_id}")
             
             # Create task
             task_manager_instance.create_task(task_id)
@@ -351,24 +532,46 @@ def create_http_app() -> FastAPI:
                         )
                 asyncio.create_task(generate_views_task())
             else:
-                raise HTTPException(status_code=404, detail=f"Unknown tool: {tool_name}")
+                return JSONResponse(
+                    content=create_jsonrpc_error_response(
+                        code=JsonRpcErrorCode.METHOD_NOT_FOUND,
+                        message=f"Unknown tool: {tool_name}",
+                        request_id=request_id
+                    )
+                )
             
+            # Return JSON-RPC success response with task info
             return JSONResponse(
-                status_code=202,
-                content={
-                    "task_id": task_id,
-                    "status": "pending",
-                    "status_url": f"/mcp/tasks/{task_id}",
-                    "result_url": f"/mcp/tasks/{task_id}/result",
-                    "message": "Task started. Poll status_url to check progress."
-                }
+                content=create_jsonrpc_success_response(
+                    result={
+                        "task_id": task_id,
+                        "status": "pending",
+                        "status_url": f"/mcp/tasks/{task_id}",
+                        "result_url": f"/mcp/tasks/{task_id}/result",
+                        "message": "Task started. Poll status_url to check progress."
+                    },
+                    request_id=request_id
+                )
             )
             
-        except HTTPException:
-            raise
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON parse error: {e}")
+            return JSONResponse(
+                content=create_jsonrpc_error_response(
+                    code=JsonRpcErrorCode.PARSE_ERROR,
+                    message=f"Parse error: {str(e)}",
+                    request_id=None
+                )
+            )
         except Exception as e:
             logger.error(f"Error starting async tool: {e}", exc_info=True)
-            raise HTTPException(status_code=500, detail=str(e))
+            return JSONResponse(
+                content=create_jsonrpc_error_response(
+                    code=JsonRpcErrorCode.INTERNAL_ERROR,
+                    message=str(e),
+                    request_id=request_id
+                )
+            )
     
     @app.get("/mcp/tasks/{task_id}", dependencies=[Depends(verify_auth)])
     async def get_task_status(task_id: str) -> Dict[str, Any]:

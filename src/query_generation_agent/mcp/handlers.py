@@ -69,7 +69,8 @@ class MCPHandlers:
             gemini_client=gemini_client,
             dryrun_validator=self.dryrun_validator,
             alignment_validator=self.alignment_validator,
-            max_iterations=config.max_query_iterations
+            max_iterations=config.max_query_iterations,
+            query_naming_strategy=config.query_naming_strategy
         )
         
         # Initialize view generation components

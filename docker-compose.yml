@@ -9,40 +9,26 @@ services:
     image: query-generation-agent:latest
     ports:
       - "8081:8081"
+    
+    # Load environment variables from .env file
+    env_file:
+      - .env
+    
+    # Override specific variables for containerized deployment
     environment:
-      # GCP Configuration
-      - GCP_PROJECT_ID=${GCP_PROJECT_ID}
-      - BQ_EXECUTION_PROJECT=${BQ_EXECUTION_PROJECT:-${GCP_PROJECT_ID}}
-      - BQ_LOCATION=${BQ_LOCATION:-US}
-      
-      # API Keys
-      - GEMINI_API_KEY=${GEMINI_API_KEY}
-      
-      # Query Generation Configuration
-      - MAX_QUERY_ITERATIONS=${MAX_QUERY_ITERATIONS:-10}
-      - MAX_QUERIES_PER_INSIGHT=${MAX_QUERIES_PER_INSIGHT:-5}
-      - QUERY_TIMEOUT_SECONDS=${QUERY_TIMEOUT_SECONDS:-120}
-      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.5-pro-latest}
-      - ALIGNMENT_THRESHOLD=${ALIGNMENT_THRESHOLD:-0.85}
-      
-      # MCP Service Configuration
-      - MCP_SERVER_NAME=query-generation-agent
-      - MCP_SERVER_VERSION=1.0.0
-      - MCP_TRANSPORT=http
+      - MCP_TRANSPORT=http  # Use HTTP for containerized deployment
       - MCP_HOST=0.0.0.0
       - MCP_PORT=8081
-      
-      # Optional Configuration
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - ENABLE_VALIDATION_LOGGING=${ENABLE_VALIDATION_LOGGING:-true}
-      - MAX_SAMPLE_ROWS=${MAX_SAMPLE_ROWS:-10}
+    
     volumes:
       # Optional: Mount GCP credentials if using service account
       # - ~/.config/gcloud:/home/appuser/.config/gcloud:ro
       # - /path/to/service-account-key.json:/app/credentials/key.json:ro
       - ./logs:/app/logs
+    
+    # Health check against MCP /health endpoint
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8081/health').read()"]
       interval: 30s
       timeout: 10s
       retries: 3

@@ -115,6 +115,7 @@ def test_query_result() -> None:
     )
     
     query = QueryResult(
+        query_name="test_query",
         sql="SELECT * FROM table",
         description="Select all rows",
         source_tables=["project.dataset.table"],
@@ -148,6 +149,7 @@ def test_generate_queries_response() -> None:
     )
     
     query1 = QueryResult(
+        query_name="query_1",
         sql="SELECT * FROM table1",
         description="Query 1",
         source_tables=["project.dataset.table1"],
@@ -159,6 +161,7 @@ def test_generate_queries_response() -> None:
     )
     
     query2 = QueryResult(
+        query_name="query_2",
         sql="SELECT * FROM table2",
         description="Query 2",
         source_tables=["project.dataset.table2"],

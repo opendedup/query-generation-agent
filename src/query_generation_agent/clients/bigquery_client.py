@@ -42,7 +42,7 @@ class BigQueryClient:
         self.timeout_seconds = timeout_seconds
         
         # Initialize BigQuery client
-        self.client = bigquery.Client(project=project_id)
+        self.client = bigquery.Client(project=project_id,location=location)
         
         logger.info(f"BigQuery client initialized for project: {project_id}")
     

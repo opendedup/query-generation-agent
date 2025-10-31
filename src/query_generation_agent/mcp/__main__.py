@@ -19,6 +19,9 @@ def run_server() -> None:
     # Apply logging level from configuration
     logging.getLogger().setLevel(config.log_level)
     
+    # Suppress verbose SQLFluff logging
+    logging.getLogger('sqlfluff').setLevel(logging.WARNING)
+    
     if config.mcp_transport.lower() == "http":
         # Run HTTP server
         import uvicorn

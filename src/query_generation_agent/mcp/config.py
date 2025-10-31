@@ -57,6 +57,11 @@ class QueryGenerationConfig(BaseSettings):
         description="Min alignment score",
         alias="ALIGNMENT_THRESHOLD",
     )
+    query_naming_strategy: str = Field(
+        default="rule_based",
+        description="Query naming strategy (rule_based/llm/hybrid)",
+        alias="QUERY_NAMING_STRATEGY",
+    )
     
     # MCP Service Configuration
     mcp_server_name: str = Field(

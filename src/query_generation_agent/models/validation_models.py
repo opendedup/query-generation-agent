@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 class ValidationStage(str, Enum):
     """Validation stages in the pipeline."""
     
+    SQLFLUFF = "sqlfluff"
     SYNTAX = "syntax"
     DRYRUN = "dryrun"
     EXECUTION = "execution"
@@ -52,6 +53,7 @@ class IterationState(BaseModel):
     sql: str = Field(..., description="SQL query being validated")
     
     # Validation results per stage
+    sqlfluff_passed: bool = Field(default=False, description="SQLFluff linting passed")
     syntax_passed: bool = Field(default=False, description="Syntax validation passed")
     dryrun_passed: bool = Field(default=False, description="Dry-run validation passed")
     execution_passed: bool = Field(default=False, description="Execution validation passed")
@@ -59,7 +61,7 @@ class IterationState(BaseModel):
     
     # Current stage
     current_stage: ValidationStage = Field(
-        default=ValidationStage.SYNTAX,
+        default=ValidationStage.SQLFLUFF,
         description="Current validation stage"
     )
     
@@ -86,7 +88,8 @@ class IterationState(BaseModel):
             True if all stages passed
         """
         return (
-            self.syntax_passed
+            self.sqlfluff_passed
+            and self.syntax_passed
             and self.dryrun_passed
             and self.execution_passed
             and self.alignment_passed
@@ -135,6 +138,7 @@ class QueryValidationHistory(BaseModel):
     
     candidate_id: str = Field(..., description="Unique identifier for this candidate")
     initial_sql: str = Field(..., description="Initial generated SQL")
+    insight: Optional[str] = Field(None, description="Original insight/question for query naming")
     
     # Iterations
     iterations: List[IterationState] = Field(
@@ -222,6 +226,8 @@ class QueryValidationHistory(BaseModel):
             
             # Show which stages passed
             stages = []
+            if iteration.sqlfluff_passed:
+                stages.append("sqlfluff")
             if iteration.syntax_passed:
                 stages.append("syntax")
             if iteration.dryrun_passed:

@@ -5,8 +5,9 @@ Iteratively refines and validates SQL queries until they pass all checks.
 """
 
 import logging
+import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from ..clients.gemini_client import GeminiClient
 from ..models.request_models import DatasetMetadata
@@ -19,6 +20,7 @@ from ..models.validation_models import (
 )
 from ..validation.alignment_validator import AlignmentValidator
 from ..validation.dryrun_validator import DryRunValidator
+from ..validation.sqlfluff_validator import SQLFluffValidator
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +41,8 @@ class QueryRefiner:
         gemini_client: GeminiClient,
         dryrun_validator: DryRunValidator,
         alignment_validator: AlignmentValidator,
-        max_iterations: int = 10
+        max_iterations: int = 10,
+        query_naming_strategy: str = "rule_based"
     ):
         """
         Initialize query refiner.
@@ -49,11 +52,14 @@ class QueryRefiner:
             dryrun_validator: Dry-run validator
             alignment_validator: Alignment validator
             max_iterations: Maximum refinement iterations per query
+            query_naming_strategy: Strategy for generating query names (rule_based/llm/hybrid)
         """
         self.gemini_client = gemini_client
+        self.sqlfluff_validator = SQLFluffValidator()
         self.dryrun_validator = dryrun_validator
         self.alignment_validator = alignment_validator
         self.max_iterations = max_iterations
+        self.query_naming_strategy = query_naming_strategy
     
     def refine_and_validate(
         self,
@@ -92,7 +98,8 @@ class QueryRefiner:
         # Initialize validation history
         history = QueryValidationHistory(
             candidate_id=candidate_id,
-            initial_sql=initial_sql
+            initial_sql=initial_sql,
+            insight=insight
         )
         
         # Convert datasets to dict format
@@ -158,6 +165,18 @@ class QueryRefiner:
                 history.final_valid = True
                 history.final_sql = current_sql
                 history.final_alignment_score = final_score
+                
+                # Generate field descriptions NOW for the final valid query (only once)
+                if iter_state.result_schema:
+                    enriched_schema = self._generate_field_descriptions_for_final_query(
+                        sql=current_sql,
+                        schema=iter_state.result_schema,
+                        insight=insight,
+                        datasets=datasets
+                    )
+                    # Update iter_state with enriched schema
+                    iter_state.result_schema = enriched_schema
+                    logger.info("Field descriptions added to final query schema")
                 
                 break
             
@@ -230,6 +249,27 @@ class QueryRefiner:
         validation_details = {}
         empty_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         
+        # Stage 0: SQLFluff validation (fast fail on obvious issues)
+        logger.info("Stage 0: SQLFluff linting")
+        iter_state.current_stage = ValidationStage.SQLFLUFF
+        sqlfluff_valid, sqlfluff_error = self.sqlfluff_validator.validate(sql)
+        iter_state.sqlfluff_passed = sqlfluff_valid
+        validation_details["sqlfluff_valid"] = sqlfluff_valid
+        
+        if not sqlfluff_valid:
+            logger.warning(f"SQLFluff validation failed: {sqlfluff_error}")
+            logger.info(f"Query that failed linting:\n{sql}")
+            iter_state.add_error(
+                stage=ValidationStage.SQLFLUFF,
+                error_type="sqlfluff_error",
+                message=sqlfluff_error or "Query failed SQLFluff linting",
+                details={"sql": sql[:500]}  # Include first 500 chars for context
+            )
+            validation_details["error_message"] = sqlfluff_error
+            validation_details["error_type"] = "sqlfluff_error"
+            return False, None, validation_details, empty_usage
+        logger.info("✓ SQLFluff validation passed")
+        
         # Skip custom syntax validation - let BigQuery be the source of truth
         logger.info("Skipping custom syntax validation - BigQuery will validate")
         iter_state.syntax_passed = True  # Mark as passed since we're not checking
@@ -291,35 +331,9 @@ class QueryRefiner:
             return False, None, validation_details, empty_usage
         logger.info(f"✓ Sample execution passed ({len(sample_rows) if sample_rows else 0} rows returned)")
         
-        # Generate field descriptions using Gemini Flash
-        if schema:
-            try:
-                logger.info("Generating field descriptions using Gemini Flash...")
-                source_datasets_dicts = self._prepare_datasets_for_descriptions(datasets)
-                field_descriptions = self.gemini_client.generate_field_descriptions(
-                    sql=sql,
-                    schema=schema,
-                    insight=insight,
-                    source_datasets=source_datasets_dicts
-                )
-                
-                # Enrich schema with descriptions
-                if field_descriptions:
-                    for field in schema:
-                        field_name = field.get("name")
-                        if field_name in field_descriptions:
-                            field["description"] = field_descriptions[field_name]
-                            logger.debug(f"Added description for field: {field_name}")
-                    
-                    # Update both iter_state and validation_details with enriched schema
-                    iter_state.result_schema = schema
-                    validation_details["result_schema"] = schema
-                    logger.info(f"✓ Generated descriptions for {len(field_descriptions)} fields")
-                else:
-                    logger.warning("No field descriptions generated")
-            except Exception as e:
-                logger.warning(f"Failed to generate field descriptions: {e}")
-                # Continue without descriptions - don't block query validation
+        # NOTE: Field descriptions are NOT generated here during validation iterations
+        # They are generated ONLY ONCE after the query passes all validations
+        # See _generate_field_descriptions_for_final_query() called after refinement loop
         
         # Stage 3: Alignment validation
         logger.info("Stage 3: Alignment validation (AI checking if results match insight)")
@@ -352,6 +366,211 @@ class QueryRefiner:
         logger.info(f"✓ Alignment validation passed (score={score_str})")
         iter_state.current_stage = ValidationStage.COMPLETE
         return True, score, validation_details, align_usage or empty_usage
+    
+    def _generate_descriptive_query_name(
+        self,
+        description: str,
+        sql: str,
+        insight: str = "",
+        query_index: int = 0,
+        naming_strategy: str = "rule_based"
+    ) -> str:
+        """
+        Generate a descriptive snake_case query name from description and SQL.
+        
+        Uses a hybrid approach that can leverage LLM for better names or use
+        rule-based extraction for speed.
+        
+        Args:
+            description: Query description from LLM
+            sql: SQL query text
+            insight: Original insight/question (for LLM naming)
+            query_index: Query index for fallback naming
+            naming_strategy: Strategy to use ("rule_based", "llm", or "hybrid")
+            
+        Returns:
+            Descriptive query name in snake_case format
+        """
+        # Try LLM approach if strategy allows
+        if naming_strategy in ("llm", "hybrid") and insight:
+            llm_name = self._generate_name_with_llm(description, sql, insight, query_index)
+            if llm_name:
+                return llm_name
+            elif naming_strategy == "llm":
+                # LLM required but failed, use fallback
+                logger.warning("LLM naming failed, using fallback naming")
+                return f"query_{query_index}"
+        
+        # Use rule-based approach
+        return self._generate_name_rule_based(description, sql, query_index)
+    
+    def _generate_name_with_llm(
+        self,
+        description: str,
+        sql: str,
+        insight: str,
+        query_index: int
+    ) -> Optional[str]:
+        """
+        Generate descriptive query name using LLM.
+        
+        Args:
+            description: Query description
+            sql: SQL query
+            insight: Original insight
+            query_index: Query index for fallback
+            
+        Returns:
+            Descriptive query name or None if generation fails
+        """
+        try:
+            # Truncate SQL for prompt (first 500 chars)
+            sql_preview = sql[:500] + ("..." if len(sql) > 500 else "")
+            
+            prompt = f"""Generate a short, descriptive identifier for this SQL query in snake_case format.
+
+INSIGHT: {insight}
+
+QUERY DESCRIPTION: {description}
+
+SQL PREVIEW:
+{sql_preview}
+
+Requirements:
+1. Maximum 5 words (joined by underscores)
+2. Use snake_case format (e.g., "simple_inner_join_approach")
+3. Capture the key distinguishing feature of this query
+4. Be specific and meaningful (avoid generic terms like "query" or "data")
+5. Focus on the approach or technique used (e.g., "cte_with_confidence_scoring", "direct_spread_calculation", "segmented_performance_analysis")
+
+Return ONLY the snake_case identifier, nothing else."""
+
+            logger.debug("Generating descriptive query name with LLM...")
+            response = self.gemini_client.client.generate_content(prompt)
+            name = response.text.strip().lower()
+            
+            # Sanitize: only allow alphanumeric and underscores
+            name = re.sub(r'[^a-z0-9_]', '_', name)
+            name = re.sub(r'_+', '_', name)  # Replace multiple underscores with single
+            name = name.strip('_')
+            
+            # Validate length (max 60 chars)
+            if name and len(name) <= 60 and len(name) >= 3:
+                logger.info(f"Generated descriptive name with LLM: {name}")
+                return name
+            else:
+                logger.warning(f"LLM generated invalid name (length={len(name)}): {name}")
+                return None
+                
+        except Exception as e:
+            logger.warning(f"Failed to generate descriptive query name with LLM: {e}")
+            return None
+    
+    def _generate_name_rule_based(
+        self,
+        description: str,
+        sql: str,
+        query_index: int
+    ) -> str:
+        """
+        Generate descriptive query name using rule-based extraction.
+        
+        Extracts key technical terms and patterns from the description and SQL.
+        
+        Args:
+            description: Query description
+            sql: SQL query
+            query_index: Query index for fallback
+            
+        Returns:
+            Descriptive query name in snake_case
+        """
+        # Extract key technical terms from description and SQL
+        key_terms: Set[str] = set()
+        
+        # Look for common SQL patterns in both description and SQL
+        patterns = {
+            'cte': r'\b(CTE|Common Table Expression|WITH\s+\w+\s+AS)\b',
+            'window': r'\b(window function|OVER|PARTITION BY|ROW_NUMBER|RANK)\b',
+            'aggregate': r'\b(SUM|AVG|COUNT|MAX|MIN|aggregat)\b',
+            'subquery': r'\b(subquery|nested|derived table)\b',
+            'union': r'\bUNION\b',
+            'pivot': r'\b(PIVOT|UNPIVOT|pivot)\b',
+            'lateral': r'\b(LATERAL|CROSS APPLY)\b',
+        }
+        
+        description_lower = description.lower()
+        sql_upper = sql.upper()
+        
+        # Check for patterns in description or SQL
+        for term, pattern in patterns.items():
+            if re.search(pattern, description, re.IGNORECASE) or re.search(pattern, sql_upper):
+                key_terms.add(term)
+        
+        # Look for join types
+        join_patterns = {
+            'inner_join': r'\bINNER\s+JOIN\b',
+            'left_join': r'\bLEFT\s+(OUTER\s+)?JOIN\b',
+            'cross_join': r'\bCROSS\s+JOIN\b',
+            'full_join': r'\bFULL\s+(OUTER\s+)?JOIN\b',
+        }
+        
+        for join_term, join_pattern in join_patterns.items():
+            if re.search(join_pattern, sql_upper):
+                key_terms.add(join_term)
+                break  # Only add one join type
+        
+        # Extract descriptive adjectives from description
+        descriptive_words = [
+            'simple', 'direct', 'modular', 'complex', 'optimized', 
+            'efficient', 'comprehensive', 'detailed', 'basic', 'advanced',
+            'straightforward', 'sophisticated', 'refined', 'enhanced'
+        ]
+        
+        for word in descriptive_words:
+            if re.search(rf'\b{word}\b', description_lower):
+                key_terms.add(word)
+                break  # Only add one adjective
+        
+        # Look for approach/strategy/method mentions
+        approach_suffix = None
+        if re.search(r'\bapproach\b', description_lower):
+            approach_suffix = 'approach'
+        elif re.search(r'\bstrategy\b', description_lower):
+            approach_suffix = 'strategy'
+        elif re.search(r'\bmethod\b', description_lower):
+            approach_suffix = 'method'
+        
+        # Build name from key terms (limit to 4-5 terms max)
+        if key_terms:
+            name_parts = sorted(list(key_terms))[:4]
+            if approach_suffix and len(name_parts) < 4:
+                name_parts.append(approach_suffix)
+            
+            query_name = '_'.join(name_parts)
+            
+            # Ensure reasonable length
+            if len(query_name) <= 60:
+                logger.debug(f"Generated rule-based name: {query_name}")
+                return query_name
+        
+        # Fallback: try to extract meaningful phrase from description
+        # Remove common prefixes
+        clean_desc = re.sub(r'^(Brief description:\s*\[?|Description:\s*)', '', description, flags=re.IGNORECASE)
+        clean_desc = clean_desc.strip('[].')
+        
+        # Extract first few meaningful words
+        words = re.findall(r'\b[a-zA-Z]+\b', clean_desc)
+        if len(words) >= 3:
+            # Take first 4 words, convert to snake_case
+            name = '_'.join(words[:4]).lower()
+            if len(name) <= 60:
+                logger.debug(f"Generated fallback name from description: {name}")
+                return name
+        
+        # Ultimate fallback
+        logger.debug(f"Using index-based fallback name: query_{query_index}")
+        return f"query_{query_index}"
     
     def _build_query_result(
         self,
@@ -400,11 +619,21 @@ class QueryRefiner:
             result_schema=final_iter.result_schema if final_iter else None
         )
         
-        # Generate unique query_name
+        # Generate descriptive query_name
+        insight = history.insight or ""
+        descriptive_name = self._generate_descriptive_query_name(
+            description=description,
+            sql=sql,
+            insight=insight,
+            query_index=query_index,
+            naming_strategy=self.query_naming_strategy
+        )
+        
+        # Add target table prefix if specified
         if target_table_name:
-            query_name = f"{target_table_name}_query_{query_index}"
+            query_name = f"{target_table_name}_{descriptive_name}"
         else:
-            query_name = f"query_{query_index}"
+            query_name = descriptive_name
         
         # Build QueryResult
         query_result = QueryResult(
@@ -511,4 +740,59 @@ class QueryRefiner:
             }
             for ds in datasets
         ]
+    
+    def _generate_field_descriptions_for_final_query(
+        self,
+        sql: str,
+        schema: List[Dict[str, str]],
+        insight: str,
+        datasets: List[DatasetMetadata]
+    ) -> List[Dict[str, str]]:
+        """
+        Generate field descriptions for the final validated query.
+        
+        This is called ONLY ONCE after a query passes all validations,
+        not during each refinement iteration.
+        
+        Args:
+            sql: Final validated SQL query
+            schema: Result schema from query execution
+            insight: Original insight/question
+            datasets: Available source datasets
+            
+        Returns:
+            Schema with enriched field descriptions
+        """
+        if not schema:
+            logger.warning("No schema provided for field description generation")
+            return schema
+        
+        try:
+            logger.info("Generating field descriptions for final validated query using Gemini Flash...")
+            source_datasets_dicts = self._prepare_datasets_for_descriptions(datasets)
+            field_descriptions = self.gemini_client.generate_field_descriptions(
+                sql=sql,
+                schema=schema,
+                insight=insight,
+                source_datasets=source_datasets_dicts
+            )
+            
+            # Enrich schema with descriptions
+            if field_descriptions:
+                for field in schema:
+                    field_name = field.get("name")
+                    if field_name in field_descriptions:
+                        field["description"] = field_descriptions[field_name]
+                        logger.debug(f"Added description for field: {field_name}")
+                
+                logger.info(f"✓ Generated descriptions for {len(field_descriptions)} fields")
+            else:
+                logger.warning("No field descriptions generated")
+            
+            return schema
+            
+        except Exception as e:
+            logger.warning(f"Failed to generate field descriptions: {e}")
+            # Return original schema without descriptions - don't fail the entire query
+            return schema
 

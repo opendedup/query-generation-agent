@@ -1,0 +1,143 @@
+[sqlfluff]
+# BigQuery dialect for proper syntax validation
+dialect = bigquery
+
+# Templater configuration
+templater = raw
+
+# Exclude patterns
+exclude_rules = None
+
+# Line length configuration (moved from rules section)
+max_line_length = 120
+
+[sqlfluff:indentation]
+# Indentation style
+indent_unit = space
+tab_space_size = 2
+indented_joins = False
+indented_using_on = True
+template_blocks_indent = True
+
+[sqlfluff:layout:type:comma]
+# Comma placement
+line_position = trailing
+
+[sqlfluff:rules]
+# Enable most rules for strict validation
+
+# L001-L099: Layout and spacing rules
+L001.trailing_whitespace = trailing
+L002.indent_style = consistent
+L003.hanging_indents = True
+L004.indent_amount = 2
+L005.comma_style = trailing
+L006.operators_between_newlines = False
+L007.operator_after_newline = False
+L008.comma_after_newline = True
+L009.select_targets_on_newline = True
+L010.capitalisation_policy = consistent
+L011.aliasing_preference = explicit
+L012.aliasing_preference = explicit
+L013.schema_required = False
+L014.quoted_identifiers = consistent
+L016.line_too_long = 120
+L019.comma_placement = trailing
+
+# L020-L049: Structure rules
+L020.table_functions = False
+L021.ambiguous_union = False
+L022.trailing_commas = False
+L026.references_from = consistent
+L027.qualify_table_references = False
+L028.allow_select_without_from = False
+L029.keywords_in_where = False
+L030.function_name_capitalisation = consistent
+L031.avoid_table_aliases = False
+L034.wildcard_selection_limit = None
+L036.select_wildcard_limit = None
+L038.leading_select_statements = False
+L040.null_comparison = consistent
+L042.join_condition_order = False
+L044.preferring_count_star = False
+L045.order_by_in_subqueries = False
+L046.unnecessary_nested_case = True
+L047.implicit_null_checks = True
+L048.quoted_identifiers_required = False
+L049.unnecessary_case = True
+
+# L050-L099: Naming and convention rules
+L051.unused_cte_table = False
+L052.semi_colon_placement = False
+L054.line_continuations = True
+L055.nested_function_spacing = False
+L057.special_case_when = False
+L059.unnecessary_quoted_identifier = False
+L061.alias_consistency = False
+L062.blocked_words = None
+L063.preferred_quoted_literal = single_quotes
+L064.table_valued_function_preference = consistent
+L066.min_max_sql_functions = consistent
+
+[sqlfluff:rules:L003]
+# Indentation rules
+
+[sqlfluff:rules:L010]
+# Capitalization of keywords
+capitalisation_policy = upper
+
+[sqlfluff:rules:L014]
+# Unquoted identifiers
+extended_capitalisation_policy = consistent
+unquoted_identifiers_policy = all
+
+[sqlfluff:rules:L016]
+# Line length
+max_line_length = 120
+ignore_comment_lines = True
+ignore_comment_clauses = True
+
+[sqlfluff:rules:L030]
+# Function name capitalisation
+capitalisation_policy = upper
+
+[sqlfluff:rules:L040]
+# Null comparison: IS NULL / IS NOT NULL vs = NULL
+null_comparison_operator = is_null
+
+[sqlfluff:rules:L042]
+# Join/from alignment
+join_clause_spacing = False
+
+[sqlfluff:rules:L047]
+# Use COUNT(*) instead of COUNT(0) or COUNT(1)
+prefer_count_1 = False
+prefer_count_0 = False
+
+[sqlfluff:rules:L051]
+# Require CTE usage
+allow_unused_cte = False
+
+[sqlfluff:rules:L052]
+# Semicolon placement
+multiline_newline = False
+require_final_semicolon = False
+
+[sqlfluff:rules:L054]
+# Grouping/indenting of WHERE conditions
+group_by_and_order_by_style = implicit
+
+[sqlfluff:rules:L063]
+# Prefer specific quote style for strings
+# This is KEY for catching 'Pick''em' issues
+preferred_quoted_literal_style = single_quotes
+force_enable = True
+
+[sqlfluff:rules:L064]
+# Table valued function preference
+prefer_without_brackets = True
+
+[sqlfluff:rules:L066]
+# MIN/MAX with CASE WHEN
+min_max_function_name_order = min_max
+

@@ -39,8 +39,11 @@ JSON response containing:
 ### Validation Pipeline
 
 1. **Query Ideation**: Generate 3-5 candidate queries using Gemini
-2. **Syntax Validation**: Parse and check SQL syntax
-3. **Dry-Run Execution**: Execute with BigQuery dry-run API
+2. **SQLFluff Linting**: Fast syntax and style validation using sqlfluff with BigQuery dialect
+   - Catches common SQL errors before expensive API calls
+   - Validates string literal syntax (e.g., detects `'Pick''em'` issues)
+   - Enforces BigQuery best practices and coding standards
+3. **Dry-Run Execution**: Execute with BigQuery dry-run API to validate query semantics
 4. **Sample Execution**: Run with LIMIT 10 to get sample results
 5. **Alignment Validation**: LLM evaluates if results match insight intent
 6. **Iterative Refinement**: If validation fails, refine and retry (up to 10 iterations)

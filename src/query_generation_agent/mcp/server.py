@@ -43,6 +43,9 @@ def create_mcp_server(config: QueryGenerationConfig | None = None) -> Server:
     # Set logging level
     logging.getLogger().setLevel(config.log_level)
     
+    # Suppress verbose SQLFluff logging
+    logging.getLogger('sqlfluff').setLevel(logging.WARNING)
+    
     # Initialize clients
     logger.info("Initializing BigQuery client...")
     bigquery_client = BigQueryClient(
