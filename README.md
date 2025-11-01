@@ -83,7 +83,6 @@ See `.env.example` for all available configuration options. Key variables:
 - `GEMINI_API_KEY`: Gemini API key for query generation
 - `MAX_QUERY_ITERATIONS`: Maximum refinement attempts (default: 10)
 - `ALIGNMENT_THRESHOLD`: Minimum score for query acceptance (default: 0.85)
-- `GEMINI_MODEL`: Model to use (default: gemini-2.5-pro-latest)
 
 ## Usage
 

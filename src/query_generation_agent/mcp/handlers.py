@@ -97,6 +97,18 @@ class MCPHandlers:
             
             logger.info(f"Generating queries for insight: {request.insight[:100]}...")
             logger.info(f"Datasets: {len(request.datasets)}")
+            
+            # Log each dataset for debugging
+            for i, ds in enumerate(request.datasets, 1):
+                full_table_id = f"{ds.project_id}.{ds.dataset_id}.{ds.table_id}"
+                logger.info(f"  Dataset {i}/{len(request.datasets)}: {full_table_id}")
+                logger.info(f"    - table_id: {ds.table_id}")
+                logger.info(f"    - project_id: {ds.project_id}")
+                logger.info(f"    - dataset_id: {ds.dataset_id}")
+                logger.info(f"    - asset_type: {ds.asset_type}")
+                logger.info(f"    - row_count: {ds.row_count}")
+                logger.info(f"    - column_count: {ds.column_count}")
+            
             logger.info(f"Max queries: {request.max_queries}")
             logger.info(f"Max iterations: {request.max_iterations}")
             
@@ -108,13 +120,71 @@ class MCPHandlers:
             refinement_tokens = 0
             alignment_tokens = 0
             
-            # Step 1: Generate initial query candidates
-            # Run in thread pool to avoid blocking the async event loop
-            success, error_msg, candidates, gen_usage = await asyncio.to_thread(
-                self.query_ideator.generate_candidates,
+            # NEW: Step 1 - Query Planning Phase
+            logger.info("=" * 80)
+            logger.info("PLANNING PHASE: Starting query plan generation")
+            logger.info("=" * 80)
+            
+            from ..generation.query_planner import QueryPlanner
+            
+            planner = QueryPlanner(gemini_client=self.gemini_client)
+            
+            # Extract conversation context if available
+            conversation_context = []
+            # TODO: Extract from request or tool_context if available in future
+            
+            success_plan, error_plan, query_plan, planning_usage = await asyncio.to_thread(
+                planner.plan_query,
                 insight=request.insight,
                 datasets=request.datasets,
-                num_queries=request.max_queries
+                conversation_context=conversation_context,
+                llm_mode=request.llm_mode
+            )
+            
+            # Track planning tokens
+            total_prompt_tokens += planning_usage.get("prompt_tokens", 0)
+            total_completion_tokens += planning_usage.get("completion_tokens", 0)
+            total_llm_calls += 1
+            
+            # Feasibility check disabled - allow all queries to proceed
+            if not success_plan:
+                # Only reject if planning completely failed
+                logger.warning(f"Query planning failed: {error_plan}")
+                error_response = {
+                    "error": f"Query planning failed: {error_plan}",
+                    "plan": query_plan.to_dict() if query_plan else None,
+                    "reasoning": query_plan.reasoning if query_plan else None,
+                    "issues": query_plan.potential_issues if query_plan else [],
+                    "suggestions": query_plan.alternative_approaches if query_plan else [],
+                    "execution_time_ms": (time.time() - start_time) * 1000
+                }
+                return [TextContent(type="text", text=json.dumps(error_response, indent=2))]
+            
+            # Log feasibility warnings but continue anyway
+            if query_plan and query_plan.feasibility_score < 0.40:
+                logger.warning(f"Low feasibility score ({query_plan.feasibility_score:.2f}), but proceeding anyway")
+                if query_plan.potential_issues:
+                    logger.warning(f"Potential issues: {query_plan.potential_issues}")
+            
+            logger.info("PLANNING PHASE: Plan generation complete")
+            logger.info(f"  Strategy: {query_plan.strategy}")
+            logger.info(f"  Feasibility: {query_plan.feasibility_score:.2f}")
+            logger.info(f"  Tables: {query_plan.tables_required}")
+            if query_plan.join_strategy:
+                logger.info(f"  Join type: {query_plan.join_strategy.get('type')}")
+                logger.info(f"  Join keys: {query_plan.join_strategy.get('join_keys')}")
+            logger.info("=" * 80)
+            logger.info("GENERATION PHASE: Creating SQL from plan")
+            logger.info("=" * 80)
+            
+            # Step 2: Generate candidates from plan
+            # Run in thread pool to avoid blocking the async event loop
+            success, error_msg, candidates, gen_usage = await asyncio.to_thread(
+                self.query_ideator.generate_from_plan,
+                query_plan=query_plan,
+                insight=request.insight,
+                datasets=request.datasets,
+                llm_mode=request.llm_mode
             )
             
             # Track generation usage
@@ -154,10 +224,16 @@ class MCPHandlers:
                         insight=request.insight,
                         datasets=request.datasets,
                         target_table_name=request.target_table_name,
-                        query_index=i
+                        query_index=i,
+                        llm_mode=request.llm_mode
                     )
                     
                     validated_queries.append(query_result)
+                    
+                    # Early stop if first valid query is found
+                    if request.stop_on_first_valid and query_result.is_valid():
+                        logger.info(f"First valid query found, stopping early (validated 1/{len(candidates)})")
+                        break
                     
                     # Aggregate per-query token usage
                     if query_result.token_usage:
@@ -315,7 +391,9 @@ class MCPHandlers:
             max_queries=arguments.get("max_queries", 3),
             max_iterations=arguments.get("max_iterations", self.config.max_query_iterations),
             require_alignment_check=arguments.get("require_alignment_check", True),
-            allow_cross_dataset=arguments.get("allow_cross_dataset", True)
+            allow_cross_dataset=arguments.get("allow_cross_dataset", True),
+            llm_mode=arguments.get("llm_mode", "fast_llm"),
+            stop_on_first_valid=arguments.get("stop_on_first_valid", False)
         )
         
         return request
@@ -646,7 +724,8 @@ class MCPHandlers:
                     self.view_generator.generate_view_ddl,
                     target_view=target_view,
                     source_datasets=request.source_datasets,
-                    target_location=request.get_target_location()
+                    target_location=request.get_target_location(),
+                    llm_mode=request.llm_mode
                 )
                 
                 if not success:
@@ -704,6 +783,11 @@ class MCPHandlers:
                     f"{result.validation_status} "
                     f"({result.generation_time_ms:.0f}ms)"
                 )
+                
+                # Early stop if first valid view is found
+                if request.stop_on_first_valid and result.validation_status == "valid":
+                    logger.info(f"First valid view found, stopping early (validated 1/{len(target_views)})")
+                    break
             
             # Build response in GenerateQueriesResponse format
             total_time = (time.time() - start_time) * 1000
@@ -786,7 +870,9 @@ class MCPHandlers:
             prp_markdown=arguments["prp_markdown"],
             source_datasets=datasets,
             target_project=arguments.get("target_project"),
-            target_dataset=arguments.get("target_dataset")
+            target_dataset=arguments.get("target_dataset"),
+            llm_mode=arguments.get("llm_mode", "fast_llm"),
+            stop_on_first_valid=arguments.get("stop_on_first_valid", True)
         )
         
         return request

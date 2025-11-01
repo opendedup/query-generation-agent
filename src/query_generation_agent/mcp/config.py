@@ -47,11 +47,6 @@ class QueryGenerationConfig(BaseSettings):
         description="Query execution timeout",
         alias="QUERY_TIMEOUT_SECONDS",
     )
-    gemini_model: str = Field(
-        default="gemini-2.5-pro-latest",
-        description="Gemini model",
-        alias="GEMINI_MODEL",
-    )
     alignment_threshold: float = Field(
         default=0.85,
         description="Min alignment score",
@@ -154,7 +149,6 @@ def load_config() -> QueryGenerationConfig:
             
         logger.info("Configuration loaded successfully")
         logger.info(f"  Project: {config.project_id}")
-        logger.info(f"  Gemini Model: {config.gemini_model}")
         logger.info(f"  Max Iterations: {config.max_query_iterations}")
         logger.info(f"  Alignment Threshold: {config.alignment_threshold}")
         logger.info(f"  Transport: {config.mcp_transport}")

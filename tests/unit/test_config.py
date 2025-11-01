@@ -28,7 +28,6 @@ def test_config_defaults() -> None:
     assert config.max_query_iterations == 10
     assert config.max_queries_per_insight == 5
     assert config.alignment_threshold == 0.85
-    assert config.gemini_model == "gemini-2.5-pro-latest"
 
 
 def test_config_validation_alignment_threshold() -> None:
@@ -121,11 +120,10 @@ def test_load_config_success(mocker: "MockerFixture") -> None:
         "GCP_PROJECT_ID": "test-project",
         "BQ_EXECUTION_PROJECT": "exec-project",
         "GEMINI_API_KEY": "test-api-key",
-        "BQ_LOCATION": "EU",
+        "BQ_LOCATION": "US",
         "MAX_QUERY_ITERATIONS": "15",
         "MAX_QUERIES_PER_INSIGHT": "5",
         "ALIGNMENT_THRESHOLD": "0.9",
-        "GEMINI_MODEL": "gemini-2.5-pro-latest",
         "MCP_TRANSPORT": "http",
         "MCP_PORT": "9000",
         "LOG_LEVEL": "DEBUG"
@@ -136,7 +134,7 @@ def test_load_config_success(mocker: "MockerFixture") -> None:
     assert config.project_id == "test-project"
     assert config.bq_execution_project == "exec-project"
     assert config.gemini_api_key == "test-api-key"
-    assert config.bq_location == "EU"
+    assert config.bq_location == "US"
     assert config.max_query_iterations == 15
     assert config.alignment_threshold == 0.9
     assert config.mcp_transport == "http"

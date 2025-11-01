@@ -7,6 +7,7 @@ before expensive BigQuery API calls.
 """
 
 import logging
+from pathlib import Path
 from typing import Optional, Tuple
 
 from sqlfluff.core import Linter, FluffConfig
@@ -34,17 +35,30 @@ class SQLFluffValidator:
         """
         self.max_errors = max_errors
         
-        try:
-            # Initialize linter with BigQuery dialect
-            # Will automatically load .sqlfluff config if present
-            self.linter = Linter(
-                dialect="bigquery",
-                config=FluffConfig.from_root()
+        config_path = Path(__file__).resolve().parents[4] / ".sqlfluff"
+        config: Optional[FluffConfig] = None
+
+        if config_path.exists():
+            try:
+                config = FluffConfig.from_path(str(config_path))
+                logger.debug(
+                    "SQLFluff config loaded from %s with dialect=%s",
+                    config_path,
+                    config.get("dialect"),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to load SQLFluff config from %s, falling back to defaults: %s",
+                    config_path,
+                    exc,
+                )
+
+        if config is not None:
+            self.linter = Linter(config=config)
+        else:
+            logger.debug(
+                "Using built-in SQLFluff configuration with BigQuery dialect"
             )
-            logger.info("SQLFluff validator initialized with BigQuery dialect")
-        except Exception as e:
-            logger.warning(f"Error initializing SQLFluff with config file, using defaults: {e}")
-            # Fall back to basic BigQuery dialect without config
             self.linter = Linter(dialect="bigquery")
     
     def validate(self, sql: str) -> Tuple[bool, Optional[str]]:
@@ -70,7 +84,7 @@ class SQLFluffValidator:
             
             # Check for violations
             if result.violations:
-                logger.info(f"SQLFluff found {len(result.violations)} violation(s)")
+                logger.debug(f"SQLFluff found {len(result.violations)} violation(s)")
                 
                 # Filter to only show errors (not warnings/info)
                 critical_violations = [
@@ -85,7 +99,7 @@ class SQLFluffValidator:
                     return False, error_msg
                 
                 # Non-critical violations: log but don't fail
-                logger.info(f"SQLFluff found {len(result.violations)} non-critical issues (not failing)")
+                logger.debug(f"SQLFluff found {len(result.violations)} non-critical issues (not failing)")
                 return True, None
             
             logger.debug("SQLFluff validation passed")

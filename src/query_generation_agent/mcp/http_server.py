@@ -89,7 +89,6 @@ def create_http_app() -> FastAPI:
             logger.info("Initializing Gemini client...")
             gemini_client = GeminiClient(
                 api_key=config_instance.gemini_api_key,
-                model_name=config_instance.gemini_model,
                 temperature=0.2,
                 max_retries=3
             )

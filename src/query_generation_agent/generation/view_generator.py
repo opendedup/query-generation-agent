@@ -36,7 +36,8 @@ class ViewGenerator:
         self,
         target_view: TargetViewSpec,
         source_datasets: List[DatasetMetadata],
-        target_location: str = ""
+        target_location: str = "",
+        llm_mode: str = "fast_llm"
     ) -> Tuple[bool, Optional[str], str]:
         """
         Generate CREATE VIEW DDL matching target schema.
@@ -45,6 +46,7 @@ class ViewGenerator:
             target_view: Target view specification from PRP
             source_datasets: Available source tables
             target_location: Target location in format project.dataset
+            llm_mode: LLM model mode ('fast_llm' or 'detailed_llm')
             
         Returns:
             Tuple of (success, error_message, ddl_statement)
@@ -57,7 +59,7 @@ class ViewGenerator:
         )
         
         # Generate DDL using Gemini
-        success, error_msg, ddl = self.gemini_client.generate_view_ddl(prompt)
+        success, error_msg, ddl = self.gemini_client.generate_view_ddl(prompt, llm_mode=llm_mode)
         
         if not success:
             logger.error(f"Failed to generate VIEW DDL: {error_msg}")

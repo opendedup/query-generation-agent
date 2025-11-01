@@ -9,16 +9,19 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from ..clients.gemini_client import GeminiClient
 from ..models.request_models import DatasetMetadata
+from .insight_parser import InsightParser
 
 logger = logging.getLogger(__name__)
 
 
 class QueryIdeator:
     """
-    Generates initial SQL query candidates using LLM.
+    Generates initial SQL query candidates using LLM with context awareness.
     
     Takes an insight and dataset schemas, generates multiple query candidates
-    that could answer the insight from different angles.
+    that could answer the insight from different angles. Uses LLM-based insight
+    parsing to extract structured context (SQL examples, dataset references, patterns)
+    for smarter query generation.
     """
     
     def __init__(self, gemini_client: GeminiClient):
@@ -29,20 +32,29 @@ class QueryIdeator:
             gemini_client: Gemini client for generation
         """
         self.gemini_client = gemini_client
+        self.insight_parser = InsightParser(gemini_client)
     
     def generate_candidates(
         self,
         insight: str,
         datasets: List[DatasetMetadata],
-        num_queries: int = 3
+        num_queries: int = 3,
+        llm_mode: str = "fast_llm",
+        example_queries: Optional[List[str]] = None,
+        previous_datasets: Optional[List[str]] = None,
+        user_context: Optional[Dict[str, Any]] = None
     ) -> Tuple[bool, Optional[str], List[Dict[str, str]], Dict[str, int]]:
         """
-        Generate initial query candidates.
+        Generate initial query candidates with context awareness.
         
         Args:
             insight: Data science insight/question to answer
             datasets: List of available datasets with schemas
             num_queries: Number of query candidates to generate
+            llm_mode: LLM model mode ('fast_llm' or 'detailed_llm')
+            example_queries: Optional example SQL queries from user
+            previous_datasets: Optional previously used datasets
+            user_context: Optional additional user context
             
         Returns:
             Tuple of (success, error_message, list of query candidates, usage_metadata)
@@ -50,16 +62,38 @@ class QueryIdeator:
         """
         empty_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         
-        logger.info(f"Generating {num_queries} query candidates for insight: {insight[:100]}...")
+        logger.info(f"Generating {num_queries} query candidates for insight...")
+        logger.info(f"Insight preview: {insight[:100]}...")
+        
+        # Parse insight with LLM to extract structured context
+        insight_context = self.insight_parser.parse(insight, llm_mode)
+        
+        # Check extraction confidence
+        if insight_context.confidence < 0.3:
+            logger.warning(f"Low extraction confidence ({insight_context.confidence:.2f}), results may be suboptimal")
+        
+        # Merge explicit + parsed context
+        all_examples = (example_queries or []) + insight_context.example_queries
+        all_dataset_refs = (previous_datasets or []) + insight_context.referenced_datasets
+        
+        logger.info(f"Context extraction: {len(all_examples)} SQL examples, {len(all_dataset_refs)} dataset references")
+        
+        # Prioritize datasets based on references
+        prioritized_datasets = self._prioritize_datasets(datasets, all_dataset_refs, insight_context)
         
         # Convert datasets to dict format for Gemini client
-        dataset_dicts = self._prepare_datasets(datasets)
+        dataset_dicts = self._prepare_datasets(prioritized_datasets)
         
-        # Generate queries using Gemini
+        # Generate queries using Gemini with enriched context
         success, error_msg, queries, usage = self.gemini_client.generate_queries(
-            insight=insight,
+            insight=insight_context.cleaned_text or insight,  # Use cleaned version
             datasets=dataset_dicts,
-            num_queries=num_queries
+            num_queries=num_queries,
+            llm_mode=llm_mode,
+            example_queries=all_examples,
+            pattern_keywords=insight_context.pattern_keywords,
+            inferred_intent=insight_context.inferred_intent,
+            user_context=user_context
         )
         
         if not success:
@@ -108,6 +142,304 @@ class QueryIdeator:
             logger.info("-" * 80)
         
         return True, None, valid_queries, usage
+    
+    def generate_from_plan(
+        self,
+        query_plan: Any,  # QueryPlan type
+        insight: str,
+        datasets: List[DatasetMetadata],
+        llm_mode: str = "fast_llm"
+    ) -> Tuple[bool, Optional[str], List[Dict[str, str]], Dict[str, int]]:
+        """
+        Generate SQL candidates following a validated query plan.
+        
+        Uses plan to create focused prompt that guides LLM to generate
+        SQL matching the planned strategy, tables, joins, and columns.
+        
+        Args:
+            query_plan: Validated query execution plan
+            insight: Original user question
+            datasets: Available datasets
+            llm_mode: LLM model mode ('fast_llm' or 'detailed_llm')
+            
+        Returns:
+            Tuple of (success, error_message, list of query candidates, usage_metadata)
+        """
+        empty_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        
+        logger.info("Generating SQL from validated query plan")
+        logger.info(f"Plan strategy: {query_plan.strategy}")
+        logger.info(f"Plan feasibility: {query_plan.feasibility_score:.2f}")
+        
+        # Build plan-guided prompt
+        prompt = self._build_plan_guided_prompt(
+            query_plan=query_plan,
+            insight=insight,
+            datasets=datasets
+        )
+        
+        # Generate fewer candidates (1-2) since plan is specific
+        num_queries = 1 if query_plan.feasibility_score >= 0.8 else 2
+        
+        logger.info(f"Generating {num_queries} candidate(s) from plan")
+        
+        # Call Gemini with focused prompt
+        try:
+            response, usage = self.gemini_client._call_with_retry(
+                prompt,
+                json_mode=True,
+                llm_mode=llm_mode
+            )
+            
+            if not response:
+                return False, "No response from LLM", [], usage
+            
+            # Parse response - expect JSON with queries array
+            import json as json_lib
+            try:
+                response_data = json_lib.loads(response)
+                queries = response_data.get("queries", [])
+            except json_lib.JSONDecodeError as e:
+                logger.error(f"Failed to parse LLM response: {e}")
+                return False, f"Invalid JSON response: {str(e)}", [], usage
+            
+            if not queries:
+                return False, "No queries in LLM response", [], usage
+            
+            # Validate and format queries
+            valid_queries = []
+            for i, query in enumerate(queries):
+                sql = query.get("sql", "").strip()
+                description = query.get("description", "").strip()
+                
+                if not sql:
+                    logger.warning(f"Query {i} has no SQL, skipping")
+                    continue
+                
+                if not description:
+                    description = f"Query generated from plan: {query_plan.strategy}"
+                
+                valid_queries.append({
+                    "sql": sql,
+                    "description": description
+                })
+            
+            if not valid_queries:
+                return False, "All generated queries were invalid", [], usage
+            
+            logger.info(f"Successfully generated {len(valid_queries)} query candidate(s)")
+            
+            return True, None, valid_queries, usage
+            
+        except Exception as e:
+            logger.error(f"Error generating from plan: {e}", exc_info=True)
+            return False, f"Generation error: {str(e)}", [], empty_usage
+    
+    def _build_plan_guided_prompt(
+        self,
+        query_plan: Any,  # QueryPlan type
+        insight: str,
+        datasets: List[DatasetMetadata]
+    ) -> str:
+        """
+        Build focused prompt using validated plan.
+        
+        Args:
+            query_plan: Query execution plan
+            insight: Original user question
+            datasets: Available datasets
+            
+        Returns:
+            Formatted prompt string
+        """
+        # Format tables from plan
+        plan_tables_str = self._format_plan_tables(query_plan, datasets)
+        
+        # Format join strategy
+        join_strategy_str = self._format_join_strategy(query_plan.join_strategy)
+        
+        # Format required columns
+        columns_str = self._format_required_columns(query_plan.columns_needed)
+        
+        # Format evidence
+        evidence_str = ""
+        if query_plan.sample_value_evidence:
+            evidence_items = []
+            for key, value in query_plan.sample_value_evidence.items():
+                evidence_items.append(f"  • {key}: {value}")
+            if evidence_items:
+                evidence_str = "\n".join(evidence_items)
+        
+        prompt = f"""Generate SQL query following this VALIDATED execution plan:
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ORIGINAL QUESTION:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{insight}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+EXECUTION PLAN (Feasibility: {query_plan.feasibility_score:.2f}):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Strategy: {query_plan.strategy}
+Reasoning: {query_plan.reasoning}
+
+Tables Required:
+{plan_tables_str}
+
+{join_strategy_str}
+
+Required Columns:
+{columns_str}
+
+Filters:
+{self._format_list_items(query_plan.filters) if query_plan.filters else "  None specified"}
+
+Aggregations:
+{self._format_list_items(query_plan.aggregations) if query_plan.aggregations else "  None specified"}
+
+Order By: {query_plan.order_by or "Not specified"}
+Limit: {query_plan.limit}
+
+Evidence from Sample Values:
+{evidence_str or "  No specific evidence provided"}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+INSTRUCTIONS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Generate SQL that implements this plan EXACTLY. Follow these rules:
+
+1. Use ONLY the tables specified in "Tables Required"
+2. Use ONLY the columns specified in "Required Columns"
+3. Implement the join strategy as specified (if applicable)
+4. Apply all filters as specified
+5. Use the specified aggregations and groupings
+6. Apply the specified ORDER BY and LIMIT
+7. Use BigQuery Standard SQL syntax
+8. Return fully qualified table names (project.dataset.table)
+9. Add comments to explain complex logic
+
+OUTPUT FORMAT (JSON):
+{{
+  "queries": [
+    {{
+      "sql": "SELECT ... FROM ... WHERE ...",
+      "description": "Brief description of what this query does"
+    }}
+  ]
+}}
+
+Generate 1 query that implements this plan.
+"""
+        
+        return prompt
+    
+    def _format_plan_tables(self, query_plan: Any, datasets: List[DatasetMetadata]) -> str:
+        """
+        Format tables from plan with schema details.
+        
+        Args:
+            query_plan: Query plan
+            datasets: Available datasets
+            
+        Returns:
+            Formatted tables string
+        """
+        # Create lookup for datasets
+        dataset_lookup = {ds.table_id: ds for ds in datasets}
+        
+        lines = []
+        for table_id in query_plan.tables_required:
+            if table_id in dataset_lookup:
+                ds = dataset_lookup[table_id]
+                full_id = ds.get_full_table_id()
+                lines.append(f"  • {full_id}")
+                lines.append(f"    Columns: {', '.join([f.get('name') for f in ds.schema[:10]])}")
+                if len(ds.schema) > 10:
+                    lines.append(f"    ... and {len(ds.schema) - 10} more columns")
+            else:
+                lines.append(f"  • {table_id} (details not available)")
+        
+        return "\n".join(lines) if lines else "  None specified"
+    
+    def _format_join_strategy(self, join_strategy: Optional[Dict[str, Any]]) -> str:
+        """
+        Format join strategy from plan.
+        
+        Args:
+            join_strategy: Join strategy dict or None
+            
+        Returns:
+            Formatted string
+        """
+        if not join_strategy:
+            return "Join Strategy: Not applicable (single table query)"
+        
+        lines = ["Join Strategy:"]
+        lines.append(f"  Type: {join_strategy.get('type', 'INNER')}")
+        
+        join_keys = join_strategy.get('join_keys', [])
+        if join_keys:
+            lines.append("  Join Keys:")
+            for jk in join_keys:
+                left = jk.get('left')
+                right = jk.get('right')
+                transform = jk.get('transformation')
+                if transform:
+                    lines.append(f"    • {left} = {transform}")
+                else:
+                    lines.append(f"    • {left} = {right}")
+        
+        evidence = join_strategy.get('evidence')
+        if evidence:
+            lines.append(f"  Evidence: {evidence}")
+        
+        return "\n".join(lines)
+    
+    def _format_required_columns(self, columns_needed: List[Dict[str, str]]) -> str:
+        """
+        Format required columns from plan.
+        
+        Args:
+            columns_needed: List of column specs
+            
+        Returns:
+            Formatted string
+        """
+        if not columns_needed:
+            return "  All columns from selected tables"
+        
+        lines = []
+        for col_spec in columns_needed:
+            table = col_spec.get('table', 'unknown')
+            column = col_spec.get('column', 'unknown')
+            purpose = col_spec.get('purpose', '')
+            
+            if purpose:
+                lines.append(f"  • {table}.{column} - {purpose}")
+            else:
+                lines.append(f"  • {table}.{column}")
+        
+        return "\n".join(lines)
+    
+    def _format_list_items(self, items: List[Dict[str, Any]]) -> str:
+        """
+        Format list of dict items.
+        
+        Args:
+            items: List of dicts
+            
+        Returns:
+            Formatted string
+        """
+        lines = []
+        for item in items:
+            # Try to format as key-value pairs
+            parts = [f"{k}={v}" for k, v in item.items()]
+            lines.append(f"  • {', '.join(parts)}")
+        
+        return "\n".join(lines) if lines else "  None"
     
     def _prepare_datasets(self, datasets: List[DatasetMetadata]) -> List[Dict[str, Any]]:
         """
@@ -211,4 +543,56 @@ class QueryIdeator:
             })
         
         return analysis
+    
+    def _prioritize_datasets(
+        self,
+        datasets: List[DatasetMetadata],
+        referenced_names: List[str],
+        insight_context: Any
+    ) -> List[DatasetMetadata]:
+        """
+        Prioritize datasets based on references in insight.
+        
+        Datasets explicitly mentioned in the insight are moved to the front of the list.
+        This helps the LLM focus on the most relevant tables.
+        
+        Args:
+            datasets: All available datasets
+            referenced_names: Dataset/table names mentioned in insight
+            insight_context: Parsed insight context
+            
+        Returns:
+            Reordered list with priority datasets first
+        """
+        if not referenced_names:
+            logger.info("No dataset references found, using original order")
+            return datasets
+        
+        priority_datasets = []
+        other_datasets = []
+        
+        for dataset in datasets:
+            full_id = dataset.get_full_table_id().lower()
+            table_id = dataset.table_id.lower()
+            
+            # Check if this dataset is referenced
+            is_referenced = any(
+                ref.lower() in full_id or 
+                ref.lower() in table_id or
+                table_id in ref.lower()
+                for ref in referenced_names
+            )
+            
+            if is_referenced:
+                priority_datasets.append(dataset)
+                logger.info(f"✓ Prioritizing dataset: {dataset.get_full_table_id()}")
+            else:
+                other_datasets.append(dataset)
+        
+        if priority_datasets:
+            logger.info(f"Prioritized {len(priority_datasets)} datasets, {len(other_datasets)} others")
+        else:
+            logger.info("No matching datasets found for references, using original order")
+        
+        return priority_datasets + other_datasets
 

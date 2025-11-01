@@ -28,7 +28,6 @@ class GeminiClient:
     def __init__(
         self,
         api_key: str,
-        model_name: str = "gemini-2.5-pro-latest",
         temperature: float = 0.2,
         max_retries: int = 3
     ):
@@ -37,27 +36,55 @@ class GeminiClient:
         
         Args:
             api_key: Gemini API key
-            model_name: Model to use for generation
+            model_name: Model to use for generation (default model, can be overridden per call)
             temperature: Temperature for generation (0-1, lower = more deterministic)
             max_retries: Maximum number of retries for failed requests
         """
-        self.model_name = model_name
         self.temperature = temperature
         self.max_retries = max_retries
         
         # Configure Gemini API
         genai.configure(api_key=api_key)
         
-        # Initialize model
-        self.model = genai.GenerativeModel(model_name)
+        # Initialize model cache
+        self.model_cache: Dict[str, Any] = {}
         
-        logger.info(f"Gemini client initialized with model: {model_name}")
+        # Model mappings for llm_mode
+        self.model_mapping = {
+            "fast_llm": "gemini-2.5-flash",
+            "detailed_llm": "gemini-2.5-pro"
+        }
+    
+    def _get_model(self, llm_mode: str = "fast_llm") -> Any:
+        """
+        Get or create a model instance based on llm_mode.
+        
+        Args:
+            llm_mode: LLM model mode ('fast_llm' or 'detailed_llm')
+            
+        Returns:
+            Gemini model instance
+        """
+        # Map llm_mode to actual model name
+        model_name = self.model_mapping.get(llm_mode, self.model_mapping["fast_llm"])
+        
+        # Check cache
+        if model_name not in self.model_cache:
+            logger.info(f"Creating new model instance for: {model_name}")
+            self.model_cache[model_name] = genai.GenerativeModel(model_name)
+        
+        return self.model_cache[model_name]
     
     def generate_queries(
         self,
         insight: str,
         datasets: List[Dict[str, Any]],
-        num_queries: int = 3
+        num_queries: int = 3,
+        llm_mode: str = "fast_llm",
+        example_queries: Optional[List[str]] = None,
+        pattern_keywords: Optional[List[str]] = None,
+        inferred_intent: Optional[str] = None,
+        user_context: Optional[Dict[str, Any]] = None
     ) -> Tuple[bool, Optional[str], Optional[List[Dict[str, str]]], Dict[str, int]]:
         """
         Generate multiple SQL query candidates for an insight.
@@ -66,6 +93,11 @@ class GeminiClient:
             insight: Data science question to answer
             datasets: List of dataset metadata with schemas
             num_queries: Number of queries to generate
+            llm_mode: LLM model mode ('fast_llm' or 'detailed_llm')
+            example_queries: Optional example SQL queries to use as templates
+            pattern_keywords: Optional detected query pattern keywords
+            inferred_intent: Optional inferred query intent
+            user_context: Optional additional user context
             
         Returns:
             Tuple of (success, error_message, list of query dicts, usage_metadata)
@@ -73,16 +105,19 @@ class GeminiClient:
         empty_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         
         try:
-            prompt = self._build_generation_prompt(insight, datasets, num_queries)
+            prompt = self._build_generation_prompt(
+                insight, datasets, num_queries,
+                example_queries, pattern_keywords, inferred_intent
+            )
             
-            logger.debug(f"Generating {num_queries} queries for insight")
+            logger.debug(f"Generating {num_queries} queries for insight using {llm_mode}")
             logger.debug("=" * 80)
             logger.debug("LLM CONTEXT - QUERY GENERATION:")
             logger.debug("-" * 80)
             logger.debug(prompt)
             logger.debug("=" * 80)
             
-            response, usage = self._call_with_retry(prompt, json_mode=True)
+            response, usage = self._call_with_retry(prompt, json_mode=True, llm_mode=llm_mode)
             
             if not response:
                 return False, "Failed to get response from Gemini", None, usage
@@ -112,7 +147,8 @@ class GeminiClient:
         original_sql: str,
         feedback: str,
         insight: str,
-        datasets: List[Dict[str, Any]]
+        datasets: List[Dict[str, Any]],
+        llm_mode: str = "fast_llm"
     ) -> Tuple[bool, Optional[str], Optional[str], Dict[str, int]]:
         """
         Refine a query based on validation feedback.
@@ -122,6 +158,7 @@ class GeminiClient:
             feedback: Validation feedback (errors, suggestions)
             insight: Original insight
             datasets: Dataset metadata
+            llm_mode: LLM model mode ('fast_llm' or 'detailed_llm')
             
         Returns:
             Tuple of (success, error_message, refined_sql, usage_metadata)
@@ -131,14 +168,14 @@ class GeminiClient:
         try:
             prompt = self._build_refinement_prompt(original_sql, feedback, insight, datasets)
             
-            logger.debug("Refining query based on feedback")
+            logger.debug(f"Refining query based on feedback using {llm_mode}")
             logger.debug("=" * 80)
             logger.debug("LLM CONTEXT - QUERY REFINEMENT:")
             logger.debug("-" * 80)
             logger.debug(prompt)
             logger.debug("=" * 80)
             
-            response, usage = self._call_with_retry(prompt, json_mode=True)
+            response, usage = self._call_with_retry(prompt, json_mode=True, llm_mode=llm_mode)
             
             if not response:
                 return False, "Failed to get response from Gemini", None, usage
@@ -169,7 +206,8 @@ class GeminiClient:
         insight: str,
         sql: str,
         sample_results: List[Dict[str, Any]],
-        schema: List[Dict[str, str]]
+        schema: List[Dict[str, str]],
+        llm_mode: str = "fast_llm"
     ) -> Tuple[bool, Optional[str], Optional[float], Optional[str], Dict[str, int]]:
         """
         Validate if query results align with the insight intent.
@@ -179,6 +217,7 @@ class GeminiClient:
             sql: SQL query that was executed
             sample_results: Sample rows from query execution
             schema: Result schema
+            llm_mode: LLM model mode ('fast_llm' or 'detailed_llm')
             
         Returns:
             Tuple of (success, error_message, alignment_score, reasoning, usage_metadata)
@@ -188,14 +227,14 @@ class GeminiClient:
         try:
             prompt = self._build_alignment_prompt(insight, sql, sample_results, schema)
             
-            logger.debug("Validating query alignment with insight")
+            logger.debug(f"Validating query alignment with insight using {llm_mode}")
             logger.debug("=" * 80)
             logger.debug("LLM CONTEXT - ALIGNMENT VALIDATION:")
             logger.debug("-" * 80)
             logger.debug(prompt)
             logger.debug("=" * 80)
             
-            response, usage = self._call_with_retry(prompt, json_mode=True)
+            response, usage = self._call_with_retry(prompt, json_mode=True, llm_mode=llm_mode)
             
             if not response:
                 return False, "Failed to get response from Gemini", None, None, usage
@@ -219,13 +258,14 @@ class GeminiClient:
             logger.error(error_msg, exc_info=True)
             return False, error_msg, None, None, empty_usage
     
-    def _call_with_retry(self, prompt: str, json_mode: bool = False) -> Tuple[Optional[str], Dict[str, int]]:
+    def _call_with_retry(self, prompt: str, json_mode: bool = False, llm_mode: str = "fast_llm") -> Tuple[Optional[str], Dict[str, int]]:
         """
         Call Gemini API with retry logic.
         
         Args:
             prompt: Prompt to send
             json_mode: Whether to request JSON output
+            llm_mode: LLM model mode ('fast_llm' or 'detailed_llm')
             
         Returns:
             Tuple of (response_text, usage_metadata)
@@ -236,9 +276,12 @@ class GeminiClient:
             response_mime_type="application/json" if json_mode else "text/plain"
         )
         
+        # Get the appropriate model
+        model = self._get_model(llm_mode)
+        
         for attempt in range(self.max_retries):
             try:
-                response = self.model.generate_content(
+                response = model.generate_content(
                     prompt,
                     generation_config=generation_config
                 )
@@ -276,14 +319,152 @@ class GeminiClient:
         
         return None, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     
+    def extract_insight_context(
+        self,
+        insight: str,
+        prompt: str,
+        response_schema: Any,
+        llm_mode: str = "fast_llm"
+    ) -> Tuple[bool, Optional[str], Optional[Dict[str, Any]], Dict[str, int]]:
+        """
+        Extract structured context from insight using JSON response schema.
+        
+        Uses Gemini's JSON schema feature to ensure structured extraction.
+        
+        Args:
+            insight: Raw insight text
+            prompt: Extraction prompt
+            response_schema: Pydantic model schema for response structure
+            llm_mode: LLM model mode ('fast_llm' or 'detailed_llm')
+            
+        Returns:
+            Tuple of (success, error_message, extracted_data_dict, usage_metadata)
+        """
+        empty_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        
+        try:
+            logger.debug(f"Extracting insight context using {llm_mode}")
+            logger.debug("=" * 80)
+            logger.debug("LLM CONTEXT - INSIGHT EXTRACTION:")
+            logger.debug("-" * 80)
+            logger.debug(prompt)
+            logger.debug("=" * 80)
+            
+            # Get the appropriate model
+            model = self._get_model(llm_mode)
+            
+            # Build generation config with JSON schema
+            # Note: Using response_mime_type with JSON for structured output
+            generation_config = GenerationConfig(
+                temperature=self.temperature,
+                response_mime_type="application/json"
+            )
+            
+            # Make the API call with retry logic
+            for attempt in range(self.max_retries):
+                try:
+                    response = model.generate_content(
+                        prompt,
+                        generation_config=generation_config
+                    )
+                    
+                    # Extract usage metadata
+                    usage = {
+                        "prompt_tokens": response.usage_metadata.prompt_token_count,
+                        "completion_tokens": response.usage_metadata.candidates_token_count,
+                        "total_tokens": response.usage_metadata.total_token_count
+                    }
+                    
+                    logger.debug(f"Token usage: {usage['total_tokens']} total "
+                               f"({usage['prompt_tokens']} prompt + {usage['completion_tokens']} completion)")
+                    
+                    # Log the response for debugging
+                    logger.debug("=" * 80)
+                    logger.debug("LLM EXTRACTION RESPONSE:")
+                    logger.debug("-" * 80)
+                    logger.debug(response.text)
+                    logger.debug("=" * 80)
+                    
+                    # Parse JSON response
+                    try:
+                        extracted_data = json.loads(response.text)
+                        
+                        # Validate against schema if provided
+                        if response_schema:
+                            try:
+                                # Validate with Pydantic
+                                validated = response_schema(**extracted_data)
+                                # Convert back to dict
+                                extracted_data = validated.model_dump()
+                            except Exception as validation_error:
+                                logger.warning(f"Schema validation failed: {validation_error}")
+                                # Continue with unvalidated data
+                        
+                        logger.info("Successfully extracted insight context")
+                        return True, None, extracted_data, usage
+                        
+                    except json.JSONDecodeError as e:
+                        logger.error(f"Failed to parse JSON response: {e}")
+                        return False, f"Invalid JSON response: {str(e)}", None, usage
+                    
+                except Exception as e:
+                    logger.warning(f"Gemini API call failed (attempt {attempt + 1}/{self.max_retries}): {e}")
+                    
+                    if attempt < self.max_retries - 1:
+                        # Exponential backoff
+                        sleep_time = 2 ** attempt
+                        logger.info(f"Retrying in {sleep_time} seconds...")
+                        time.sleep(sleep_time)
+                    else:
+                        logger.error("All retry attempts failed")
+                        error_msg = f"Failed after {self.max_retries} attempts: {str(e)}"
+                        return False, error_msg, None, empty_usage
+            
+            return False, "Max retries exceeded", None, empty_usage
+            
+        except Exception as e:
+            error_msg = f"Error extracting insight context: {str(e)}"
+            logger.error(error_msg, exc_info=True)
+            return False, error_msg, None, empty_usage
+    
     def _build_generation_prompt(
         self,
         insight: str,
         datasets: List[Dict[str, Any]],
-        num_queries: int
+        num_queries: int,
+        example_queries: Optional[List[str]] = None,
+        pattern_keywords: Optional[List[str]] = None,
+        inferred_intent: Optional[str] = None
     ) -> str:
-        """Build prompt for initial query generation."""
+        """
+        Build prompt for initial query generation.
         
+        Args:
+            insight: Data science question
+            datasets: Dataset metadata
+            num_queries: Number of queries to generate
+            example_queries: Optional example SQL queries
+            pattern_keywords: Optional pattern keywords
+            inferred_intent: Optional inferred intent
+            
+        Returns:
+            Formatted prompt string
+        """
+        # Use context-aware prompt builder if context is provided
+        from ..generation.prompt_templates import build_generation_prompt_with_context
+        
+        if example_queries or pattern_keywords or inferred_intent:
+            # Use context-aware prompt
+            return build_generation_prompt_with_context(
+                insight=insight,
+                datasets=datasets,
+                num_queries=num_queries,
+                example_queries=example_queries,
+                pattern_keywords=pattern_keywords,
+                inferred_intent=inferred_intent
+            )
+        
+        # Fall back to original prompt building for backward compatibility
         # Format dataset schemas
         dataset_info = []
         for ds in datasets:
@@ -510,25 +691,26 @@ Provide your evaluation now:"""
         
         return "\n".join(lines)
     
-    def generate_view_ddl(self, prompt: str) -> Tuple[bool, Optional[str], str]:
+    def generate_view_ddl(self, prompt: str, llm_mode: str = "fast_llm") -> Tuple[bool, Optional[str], str]:
         """
         Generate CREATE VIEW DDL statement from prompt.
         
         Args:
             prompt: Formatted prompt with target schema and source tables
+            llm_mode: LLM model mode ('fast_llm' or 'detailed_llm')
             
         Returns:
             Tuple of (success, error_message, ddl_statement)
         """
         try:
-            logger.debug("Generating VIEW DDL")
+            logger.debug(f"Generating VIEW DDL using {llm_mode}")
             logger.debug("=" * 80)
             logger.debug("LLM CONTEXT - VIEW DDL GENERATION:")
             logger.debug("-" * 80)
             logger.debug(prompt)
             logger.debug("=" * 80)
             
-            response = self._call_with_retry(prompt, json_mode=False)
+            response, usage = self._call_with_retry(prompt, json_mode=False, llm_mode=llm_mode)
             
             if not response:
                 return False, "Failed to get response from Gemini", ""
@@ -552,10 +734,11 @@ Provide your evaluation now:"""
         sql: str,
         schema: List[Dict[str, str]],
         insight: str,
-        source_datasets: List[Dict[str, Any]]
+        source_datasets: List[Dict[str, Any]],
+        llm_mode: str = "fast_llm"
     ) -> Dict[str, str]:
         """
-        Generate semantic descriptions for query output fields using Gemini Flash.
+        Generate semantic descriptions for query output fields using Gemini.
         
         Leverages existing field descriptions from source table schemas (provided by
         data-discovery-agent) and the SQL query logic to generate clear, concise 
@@ -568,6 +751,7 @@ Provide your evaluation now:"""
             source_datasets: Source datasets with schema descriptions from data-discovery-agent
                             Each dataset has: {"table_id": "...", "description": "...", 
                             "schema": [{"name": "...", "type": "...", "description": "..."}]}
+            llm_mode: LLM model mode ('fast_llm' or 'detailed_llm')
             
         Returns:
             Dictionary mapping field names to descriptions
@@ -576,17 +760,17 @@ Provide your evaluation now:"""
             # Build prompt for field description generation
             prompt = self._build_field_description_prompt(sql, schema, insight, source_datasets)
             
-            logger.debug("Generating field descriptions using Gemini Flash")
+            logger.debug(f"Generating field descriptions using {llm_mode}")
             logger.debug("=" * 80)
             logger.debug("LLM CONTEXT - FIELD DESCRIPTION GENERATION:")
             logger.debug("-" * 80)
             logger.debug(prompt)
             logger.debug("=" * 80)
             
-            # Use Flash model for speed and cost efficiency
-            flash_model = genai.GenerativeModel("gemini-flash-latest")
+            # Use the selected model
+            model = self._get_model(llm_mode)
             
-            response = flash_model.generate_content(
+            response = model.generate_content(
                 prompt,
                 generation_config=GenerationConfig(
                     temperature=0.2,

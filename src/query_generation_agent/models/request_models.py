@@ -4,9 +4,47 @@ Request Models for Query Generation Agent
 Defines input data structures for query generation requests.
 """
 
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
+
+
+@dataclass
+class InsightContext:
+    """
+    Structured context extracted from insight text using LLM.
+    
+    This enriches the raw insight with machine-parseable metadata
+    that helps guide query generation.
+    """
+    
+    # Original insight text
+    original_text: str
+    
+    # Cleaned/clarified insight (from LLM, with SQL blocks removed)
+    cleaned_text: str
+    
+    # Extracted SQL examples from insight
+    example_queries: List[str] = field(default_factory=list)
+    
+    # Referenced dataset/table names found in insight
+    referenced_datasets: List[str] = field(default_factory=list)
+    
+    # Query pattern keywords (e.g., "cohort", "time-series", "pivot")
+    pattern_keywords: List[str] = field(default_factory=list)
+    
+    # Intent classification (e.g., "aggregation", "filtering", "joining")
+    inferred_intent: Optional[str] = None
+    
+    # LLM's reasoning for the extraction
+    reasoning: Optional[str] = None
+    
+    # Confidence score (0-1) for extraction quality
+    confidence: float = 0.5
+    
+    # Additional context metadata
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 class DatasetMetadata(BaseModel):
@@ -260,6 +298,32 @@ class GenerateQueriesRequest(BaseModel):
         description="Name of target table/view for query naming"
     )
     
+    llm_mode: str = Field(
+        default="fast_llm",
+        description="LLM model mode: 'fast_llm' uses gemini-2.5-flash, 'detailed_llm' uses gemini-2.5-pro"
+    )
+    
+    stop_on_first_valid: bool = Field(
+        default=False,
+        description="Stop validation after first valid query is found"
+    )
+    
+    # NEW: Optional context fields for enhanced query generation
+    example_queries: Optional[List[str]] = Field(
+        default=None,
+        description="Example SQL queries that show the desired pattern or approach"
+    )
+    
+    previous_datasets: Optional[List[str]] = Field(
+        default=None,
+        description="Previously used datasets that user might want to reference"
+    )
+    
+    user_context: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Additional user context (query history, preferences, etc.)"
+    )
+    
     def get_datasets_summary(self) -> str:
         """
         Get summary of all datasets in the request.
@@ -325,6 +389,16 @@ class GenerateViewsRequest(BaseModel):
     target_dataset: Optional[str] = Field(
         None,
         description="BigQuery dataset where views should be created"
+    )
+    
+    llm_mode: str = Field(
+        default="fast_llm",
+        description="LLM model mode: 'fast_llm' uses gemini-2.5-flash, 'detailed_llm' uses gemini-2.5-pro"
+    )
+    
+    stop_on_first_valid: bool = Field(
+        default=True,
+        description="Stop validation after first valid view is found"
     )
     
     def get_target_location(self) -> str:

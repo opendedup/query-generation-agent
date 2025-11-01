@@ -15,7 +15,6 @@ from ..models.response_models import QueryResult, ValidationResult
 from ..models.validation_models import (
     IterationState,
     QueryValidationHistory,
-    ValidationError,
     ValidationStage,
 )
 from ..validation.alignment_validator import AlignmentValidator
@@ -69,7 +68,8 @@ class QueryRefiner:
         insight: str,
         datasets: List[DatasetMetadata],
         target_table_name: Optional[str] = None,
-        query_index: int = 0
+        query_index: int = 0,
+        llm_mode: str = "fast_llm"
     ) -> QueryResult:
         """
         Refine and validate a query candidate through iterative feedback.
@@ -82,6 +82,7 @@ class QueryRefiner:
             datasets: Available datasets
             target_table_name: Name of target table for query naming
             query_index: Index of this query for unique naming
+            llm_mode: LLM model mode ('fast_llm' or 'detailed_llm')
             
         Returns:
             QueryResult with final validation status
@@ -132,7 +133,8 @@ class QueryRefiner:
                 sql=current_sql,
                 insight=insight,
                 iter_state=iter_state,
-                datasets=datasets
+                datasets=datasets,
+                llm_mode=llm_mode
             )
             
             # Track alignment token usage
@@ -172,7 +174,8 @@ class QueryRefiner:
                         sql=current_sql,
                         schema=iter_state.result_schema,
                         insight=insight,
-                        datasets=datasets
+                        datasets=datasets,
+                        llm_mode=llm_mode
                     )
                     # Update iter_state with enriched schema
                     iter_state.result_schema = enriched_schema
@@ -193,7 +196,8 @@ class QueryRefiner:
                 original_sql=current_sql,
                 feedback=feedback,
                 insight=insight,
-                datasets=dataset_dicts
+                datasets=dataset_dicts,
+                llm_mode=llm_mode
             )
             
             # Track refinement token usage
@@ -232,7 +236,8 @@ class QueryRefiner:
         sql: str,
         insight: str,
         iter_state: IterationState,
-        datasets: List[DatasetMetadata]
+        datasets: List[DatasetMetadata],
+        llm_mode: str = "fast_llm"
     ) -> tuple[bool, Optional[float], Optional[Dict[str, Any]], Dict[str, int]]:
         """
         Run the full validation pipeline on a query.
@@ -242,6 +247,7 @@ class QueryRefiner:
             insight: Original insight
             iter_state: Iteration state to update
             datasets: Available datasets (for field description generation)
+            llm_mode: LLM model mode ('fast_llm' or 'detailed_llm')
             
         Returns:
             Tuple of (is_valid, alignment_score, validation_details, usage_metadata)
@@ -342,7 +348,8 @@ class QueryRefiner:
             insight=insight,
             sql=sql,
             sample_results=sample_rows or [],
-            result_schema=schema or []
+            result_schema=schema or [],
+            llm_mode=llm_mode
         )
         iter_state.alignment_passed = aligned
         iter_state.alignment_score = score
@@ -746,7 +753,8 @@ Return ONLY the snake_case identifier, nothing else."""
         sql: str,
         schema: List[Dict[str, str]],
         insight: str,
-        datasets: List[DatasetMetadata]
+        datasets: List[DatasetMetadata],
+        llm_mode: str = "fast_llm"
     ) -> List[Dict[str, str]]:
         """
         Generate field descriptions for the final validated query.
@@ -759,6 +767,7 @@ Return ONLY the snake_case identifier, nothing else."""
             schema: Result schema from query execution
             insight: Original insight/question
             datasets: Available source datasets
+            llm_mode: LLM model mode ('fast_llm' or 'detailed_llm')
             
         Returns:
             Schema with enriched field descriptions
@@ -774,7 +783,8 @@ Return ONLY the snake_case identifier, nothing else."""
                 sql=sql,
                 schema=schema,
                 insight=insight,
-                source_datasets=source_datasets_dicts
+                source_datasets=source_datasets_dicts,
+                llm_mode=llm_mode
             )
             
             # Enrich schema with descriptions

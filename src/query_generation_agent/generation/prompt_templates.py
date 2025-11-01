@@ -4,7 +4,7 @@ Prompt Templates for Query Generation
 Centralized prompt templates for Gemini interactions.
 """
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 
 def format_schema_fields(schema_fields: List[Dict[str, Any]]) -> str:
@@ -383,4 +383,169 @@ def build_alignment_prompt(
         schema=schema_text,
         sample_results=sample_text
     )
+
+
+# Context-Aware Prompt Templates
+
+
+def build_example_queries_section(example_queries: List[str]) -> str:
+    """
+    Build section showing example SQL queries.
+    
+    Args:
+        example_queries: List of SQL query examples
+        
+    Returns:
+        Formatted section string or empty string if no examples
+    """
+    if not example_queries:
+        return ""
+    
+    examples_text = "\n\n".join(
+        f"Example {i}:\n```sql\n{query}\n```"
+        for i, query in enumerate(example_queries[:3], 1)  # Limit to 3 examples
+    )
+    
+    return f"""
+EXAMPLE SQL PATTERNS (from user):
+The user provided these example queries as reference patterns. Use them as templates or inspiration 
+for the new queries. Adapt their structure, logic, and patterns to work with the available datasets.
+
+{examples_text}
+
+IMPORTANT: Analyze these examples to understand:
+- The query structure and JOIN patterns
+- The type of analysis being performed
+- The aggregation and grouping strategies used
+- The filtering and WHERE clause patterns
+Then adapt these patterns to the available tables and schema.
+"""
+
+
+def build_intent_section(
+    inferred_intent: Optional[str],
+    pattern_keywords: Optional[List[str]]
+) -> str:
+    """
+    Build section explaining detected intent and patterns.
+    
+    Args:
+        inferred_intent: Primary query intent
+        pattern_keywords: Detected pattern keywords
+        
+    Returns:
+        Formatted section string or empty string if no intent/patterns
+    """
+    if not inferred_intent and not pattern_keywords:
+        return ""
+    
+    parts = []
+    
+    if inferred_intent:
+        parts.append(f"**PRIMARY QUERY INTENT**: {inferred_intent.upper().replace('_', ' ')}")
+    
+    if pattern_keywords:
+        patterns_str = ", ".join(pattern_keywords)
+        parts.append(f"**DETECTED PATTERNS**: {patterns_str}")
+    
+    section = "\n".join(parts)
+    
+    return f"""
+DETECTED ANALYSIS TYPE:
+{section}
+
+Focus your query generation on this type of analysis. Use SQL patterns and techniques 
+that are appropriate for {inferred_intent or 'this analysis'}.
+"""
+
+
+def build_generation_prompt_with_context(
+    insight: str,
+    datasets: List[Dict[str, Any]],
+    num_queries: int,
+    example_queries: Optional[List[str]] = None,
+    pattern_keywords: Optional[List[str]] = None,
+    inferred_intent: Optional[str] = None
+) -> str:
+    """
+    Build context-aware prompt for query generation.
+    
+    Args:
+        insight: Data science insight
+        datasets: Dataset metadata
+        num_queries: Number of queries to generate
+        example_queries: Optional example SQL queries
+        pattern_keywords: Optional pattern keywords
+        inferred_intent: Optional inferred intent
+        
+    Returns:
+        Complete prompt string with context
+    """
+    datasets_text = format_dataset_info(datasets)
+    
+    # Build optional sections
+    examples_section = build_example_queries_section(example_queries or [])
+    intent_section = build_intent_section(inferred_intent, pattern_keywords)
+    
+    # Build intent-specific guidance
+    intent_guidance = ""
+    if inferred_intent:
+        guidance_map = {
+            "cohort_analysis": "Focus on grouping by time periods and tracking metrics across cohorts. Use DATE_TRUNC or similar functions.",
+            "time_series_analysis": "Include temporal grouping and sorting. Consider window functions for trends.",
+            "aggregation": "Use appropriate aggregate functions (SUM, AVG, COUNT, MAX, MIN). Consider GROUP BY for segmentation.",
+            "filtering": "Write precise WHERE clauses. Use sample values to understand valid filter conditions.",
+            "joining": "Carefully examine JOIN keys in sample values. Ensure compatible types and matching values.",
+            "pivot_analysis": "Consider using CASE WHEN for pivoting or BigQuery's PIVOT syntax.",
+            "window_functions": "Use OVER clauses with PARTITION BY and ORDER BY for window functions.",
+            "ranking": "Use RANK(), DENSE_RANK(), or ROW_NUMBER() with appropriate PARTITION BY.",
+        }
+        intent_guidance = guidance_map.get(inferred_intent, "")
+        if intent_guidance:
+            intent_guidance = f"\n**INTENT-SPECIFIC GUIDANCE**: {intent_guidance}\n"
+    
+    prompt = f"""You are an expert SQL query generator for BigQuery. Your task is to generate {num_queries} different SQL queries that answer the following data science insight.
+
+INSIGHT:
+{insight}
+{examples_section}
+{intent_section}
+
+AVAILABLE DATASETS:
+{datasets_text}
+
+QUERY GENERATION GUIDELINES:
+1. USE THE SAMPLE VALUES: The schema includes sample values for each column - use these to understand data patterns and write appropriate filters
+2. LEVERAGE COLUMN STATISTICS: Min/max values and distinct counts help you write efficient WHERE clauses and understand data distributions
+3. LEARN FROM ANALYTICAL INSIGHTS: The example analytics questions show common use patterns for these tables
+4. CONSIDER DATA LINEAGE: Upstream sources indicate data freshness and quality
+5. USE APPROPRIATE AGGREGATIONS: For numeric columns with wide ranges, consider aggregations like AVG, SUM, COUNT
+6. FILTER WISELY: Use sample values to create realistic filter conditions
+7. GROUP STRATEGICALLY: Columns with low distinct counts (<100) are good candidates for GROUP BY
+{intent_guidance}
+
+REQUIREMENTS:
+1. Generate exactly {num_queries} distinct queries that answer the insight from different angles
+2. Use only the tables and columns shown above
+3. Write valid BigQuery SQL (use backticks for table/column names with special chars)
+4. Include appropriate aggregations, filters, and GROUP BY clauses
+5. Leverage sample values to create realistic examples
+6. Consider column statistics when choosing aggregation strategies
+7. Each query should be self-contained and executable
+8. Include a brief description of what each query does
+
+OUTPUT FORMAT (JSON):
+{{
+    "queries": [
+        {{
+            "sql": "SELECT ...",
+            "description": "Brief description of what this query calculates"
+        }},
+        ...
+    ]
+}}
+
+Generate the queries now:"""
+    
+    return prompt
 

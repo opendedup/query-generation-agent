@@ -57,7 +57,6 @@ def create_mcp_server(config: QueryGenerationConfig | None = None) -> Server:
     logger.info("Initializing Gemini client...")
     gemini_client = GeminiClient(
         api_key=config.gemini_api_key,
-        model_name=config.gemini_model,
         temperature=0.2,  # Lower temperature for more deterministic SQL generation
         max_retries=3
     )

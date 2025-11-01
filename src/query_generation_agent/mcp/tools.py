@@ -245,6 +245,17 @@ def get_available_tools() -> list[Tool]:
                         "description": "Allow joins across datasets (default: true)",
                         "default": True
                     },
+                    "llm_mode": {
+                        "type": "string",
+                        "description": "LLM model mode: 'fast_llm' uses gemini-2.5-flash, 'detailed_llm' uses gemini-2.5-pro (default: fast_llm)",
+                        "enum": ["fast_llm", "detailed_llm"],
+                        "default": "fast_llm"
+                    },
+                    "stop_on_first_valid": {
+                        "type": "boolean",
+                        "description": "Stop validation after first valid query is found (default: false). When true, generates all candidates first, then validates one-by-one until first success.",
+                        "default": True
+                    },
                     "target_table_name": {
                         "type": "string",
                         "description": "Name of target table/view these queries populate (used for naming)"
@@ -341,6 +352,17 @@ def get_available_tools() -> list[Tool]:
                     "target_dataset": {
                         "type": "string",
                         "description": "BigQuery dataset where views should be created (optional)"
+                    },
+                    "llm_mode": {
+                        "type": "string",
+                        "description": "LLM model mode: 'fast_llm' uses gemini-2.5-flash, 'detailed_llm' uses gemini-2.5-pro (default: fast_llm)",
+                        "enum": ["fast_llm", "detailed_llm"],
+                        "default": "fast_llm"
+                    },
+                    "stop_on_first_valid": {
+                        "type": "boolean",
+                        "description": "Stop validation after first valid view is found (default: true). When true, generates all view DDL first, then validates one-by-one until first success.",
+                        "default": True
                     }
                 },
                 "required": ["prp_markdown", "source_datasets"]

@@ -39,7 +39,8 @@ class AlignmentValidator:
         insight: str,
         sql: str,
         sample_results: List[Dict[str, Any]],
-        result_schema: List[Dict[str, str]]
+        result_schema: List[Dict[str, str]],
+        llm_mode: str = "fast_llm"
     ) -> Tuple[bool, Optional[str], Optional[float], Optional[str], Optional[Dict[str, Any]]]:
         """
         Validate alignment between query results and insight.
@@ -49,6 +50,7 @@ class AlignmentValidator:
             sql: SQL query that was executed
             sample_results: Sample rows from query execution
             result_schema: Schema of query results
+            llm_mode: LLM model mode ('fast_llm' or 'detailed_llm')
             
         Returns:
             Tuple of (is_aligned, error_message, alignment_score, reasoning, usage)
@@ -77,7 +79,8 @@ class AlignmentValidator:
             insight=insight,
             sql=sql,
             sample_results=sample_results,
-            schema=result_schema
+            schema=result_schema,
+            llm_mode=llm_mode
         )
         
         if not success:
