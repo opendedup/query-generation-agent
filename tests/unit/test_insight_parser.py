@@ -24,7 +24,6 @@ def test_extraction_response_schema_validation() -> None:
     schema = ExtractionResponseSchema(
         cleaned_insight="What is the average transaction value by region?",
         example_queries=["SELECT AVG(amount) FROM transactions"],
-        referenced_datasets=["transactions"],
         pattern_keywords=["aggregation"],
         primary_intent="aggregation",
         reasoning="User wants to calculate average transaction values",
@@ -42,7 +41,6 @@ def test_extraction_response_schema_validation() -> None:
     )
     
     assert schema_minimal.example_queries == []
-    assert schema_minimal.referenced_datasets == []
     assert schema_minimal.confidence == 0.5
 
 
@@ -72,7 +70,6 @@ def test_insight_parser_build_extraction_prompt() -> None:
     assert "INSIGHT TEXT:" in prompt
     assert insight in prompt
     assert "Extract SQL Examples" in prompt
-    assert "Identify Dataset References" in prompt
     assert "Detect Query Patterns" in prompt
     assert "Classify Primary Intent" in prompt
     assert "cohort" in prompt
@@ -91,7 +88,6 @@ def test_insight_parser_fallback_context(mocker: "MockerFixture") -> None:
     assert context.original_text == insight
     assert context.cleaned_text == insight
     assert context.example_queries == []
-    assert context.referenced_datasets == []
     assert context.confidence == 0.0
     assert "fallback" in context.reasoning.lower()
 
@@ -107,7 +103,6 @@ def test_insight_parser_parse_with_llm_success(mocker: "MockerFixture") -> None:
         {  # extracted_data
             "cleaned_insight": "Calculate average transaction value by payment method",
             "example_queries": ["SELECT AVG(amount) FROM transactions GROUP BY payment_method"],
-            "referenced_datasets": ["transactions"],
             "pattern_keywords": ["aggregation", "group_by"],
             "primary_intent": "aggregation",
             "reasoning": "User wants aggregation analysis grouped by payment method",
@@ -129,7 +124,6 @@ def test_insight_parser_parse_with_llm_success(mocker: "MockerFixture") -> None:
     assert context.original_text == insight
     assert context.cleaned_text == "Calculate average transaction value by payment method"
     assert len(context.example_queries) == 1
-    assert "transactions" in context.referenced_datasets
     assert "aggregation" in context.pattern_keywords
     assert context.inferred_intent == "aggregation"
     assert context.confidence == 0.85
@@ -174,7 +168,6 @@ def test_insight_parser_parse_with_sql_examples(mocker: "MockerFixture") -> None
             "example_queries": [
                 "SELECT DATE_TRUNC(signup_date, MONTH) as cohort, COUNT(*) as users FROM users GROUP BY cohort"
             ],
-            "referenced_datasets": ["users"],
             "pattern_keywords": ["cohort", "aggregation", "time_series"],
             "primary_intent": "cohort_analysis",
             "reasoning": "User wants cohort analysis with temporal grouping",
@@ -202,37 +195,6 @@ def test_insight_parser_parse_with_sql_examples(mocker: "MockerFixture") -> None
     assert context.confidence == 0.95
 
 
-def test_insight_parser_parse_with_dataset_references(mocker: "MockerFixture") -> None:
-    """Test parsing insight with explicit dataset references."""
-    mock_gemini_client = mocker.Mock()
-    
-    # Mock extraction with multiple dataset references
-    mock_gemini_client.extract_insight_context.return_value = (
-        True,
-        None,
-        {
-            "cleaned_insight": "Calculate customer lifetime value using customer and order data",
-            "example_queries": [],
-            "referenced_datasets": ["customers", "orders", "transactions"],
-            "pattern_keywords": ["join", "aggregation"],
-            "primary_intent": "joining",
-            "reasoning": "Query requires joining customers with orders to calculate LTV",
-            "confidence": 0.8
-        },
-        {"prompt_tokens": 120, "completion_tokens": 60, "total_tokens": 180}
-    )
-    
-    parser = InsightParser(mock_gemini_client)
-    
-    insight = "Using the customers and orders tables, calculate customer lifetime value"
-    context = parser.parse(insight, llm_mode="fast_llm")
-    
-    assert len(context.referenced_datasets) >= 2
-    assert "customers" in context.referenced_datasets
-    assert "orders" in context.referenced_datasets
-    assert "joining" == context.inferred_intent
-
-
 def test_insight_parser_low_confidence_warning(mocker: "MockerFixture", caplog: pytest.LogCaptureFixture) -> None:
     """Test that low confidence extraction logs warning."""
     import logging
@@ -248,7 +210,6 @@ def test_insight_parser_low_confidence_warning(mocker: "MockerFixture", caplog: 
         {
             "cleaned_insight": "Do something with data",
             "example_queries": [],
-            "referenced_datasets": [],
             "pattern_keywords": [],
             "primary_intent": None,
             "reasoning": "Insight is very vague and unclear",
@@ -273,7 +234,6 @@ def test_insight_context_dataclass() -> None:
         original_text="Original insight",
         cleaned_text="Cleaned insight",
         example_queries=["SELECT * FROM table"],
-        referenced_datasets=["table1", "table2"],
         pattern_keywords=["aggregation"],
         inferred_intent="aggregation",
         reasoning="Test reasoning",
@@ -284,7 +244,6 @@ def test_insight_context_dataclass() -> None:
     assert context.original_text == "Original insight"
     assert context.cleaned_text == "Cleaned insight"
     assert len(context.example_queries) == 1
-    assert len(context.referenced_datasets) == 2
     assert context.inferred_intent == "aggregation"
     assert context.confidence == 0.75
     assert context.metadata["extraction_method"] == "llm"

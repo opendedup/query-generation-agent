@@ -92,6 +92,53 @@ class MCPHandlers:
         start_time = time.time()
         
         try:
+            # NEW: Resolve dataset_ids to full dataset metadata
+            if "dataset_ids" in arguments:
+                from ..clients.discovery_client import DiscoveryClient
+                
+                discovery_client = DiscoveryClient(base_url=self.config.discovery_agent_url)
+                
+                try:
+                    dataset_ids = arguments["dataset_ids"]
+                    logger.info(f"Fetching {len(dataset_ids)} datasets from discovery agent at {self.config.discovery_agent_url}")
+                    
+                    # Fetch datasets in parallel (returns List[Dict])
+                    datasets = await discovery_client.get_multiple_datasets_by_ids(
+                        dataset_ids=dataset_ids
+                    )
+                    
+                    # Replace dataset_ids with fetched datasets (as dicts)
+                    arguments["datasets"] = datasets
+                    del arguments["dataset_ids"]
+                    
+                    logger.info(f"Successfully fetched {len(datasets)} datasets from discovery agent")
+                    
+                except Exception as e:
+                    logger.error(f"Failed to fetch datasets from discovery agent: {e}", exc_info=True)
+                    # Return detailed error response
+                    error_response = {
+                        "error": f"Failed to fetch datasets from discovery agent",
+                        "error_type": "discovery_client_error",
+                        "error_details": str(e),
+                        "context": {
+                            "discovery_agent_url": self.config.discovery_agent_url,
+                            "dataset_ids_requested": dataset_ids,
+                            "insight": arguments.get("insight", "")[:200]
+                        },
+                        "queries": [],
+                        "total_attempted": 0,
+                        "total_validated": 0,
+                        "execution_time_ms": (time.time() - start_time) * 1000,
+                        "suggestions": [
+                            "Verify the data-discovery-agent is running and accessible",
+                            "Check the DISCOVERY_AGENT_URL configuration",
+                            "Review data-discovery-agent logs for more details"
+                        ]
+                    }
+                    return [TextContent(type="text", text=json.dumps(error_response, indent=2))]
+                finally:
+                    await discovery_client.close()
+            
             # Parse and validate request
             request = self._parse_request(arguments)
             
@@ -149,13 +196,28 @@ class MCPHandlers:
             # Feasibility check disabled - allow all queries to proceed
             if not success_plan:
                 # Only reject if planning completely failed
-                logger.warning(f"Query planning failed: {error_plan}")
+                logger.error(f"Query planning failed: {error_plan}", exc_info=True)
                 error_response = {
-                    "error": f"Query planning failed: {error_plan}",
+                    "error": "Query planning failed",
+                    "error_type": "planning_error",
+                    "error_details": error_plan,
+                    "context": {
+                        "insight": request.insight[:200],
+                        "dataset_count": len(request.datasets),
+                        "datasets": [f"{ds.project_id}.{ds.dataset_id}.{ds.table_id}" for ds in request.datasets],
+                        "llm_mode": request.llm_mode
+                    },
                     "plan": query_plan.to_dict() if query_plan else None,
                     "reasoning": query_plan.reasoning if query_plan else None,
                     "issues": query_plan.potential_issues if query_plan else [],
-                    "suggestions": query_plan.alternative_approaches if query_plan else [],
+                    "suggestions": query_plan.alternative_approaches if query_plan else [
+                        "Verify the insight is clear and specific",
+                        "Check that datasets contain relevant columns for the insight",
+                        "Consider breaking down complex insights into simpler parts"
+                    ],
+                    "queries": [],
+                    "total_attempted": 0,
+                    "total_validated": 0,
                     "execution_time_ms": (time.time() - start_time) * 1000
                 }
                 return [TextContent(type="text", text=json.dumps(error_response, indent=2))]
@@ -194,12 +256,29 @@ class MCPHandlers:
             generation_tokens += gen_usage.get("total_tokens", 0)
             
             if not success or not candidates:
+                logger.error(f"Failed to generate query candidates: {error_msg}", exc_info=True)
                 error_response = {
-                    "error": f"Failed to generate query candidates: {error_msg}",
+                    "error": "Failed to generate query candidates",
+                    "error_type": "generation_error",
+                    "error_details": error_msg,
+                    "context": {
+                        "insight": request.insight[:200],
+                        "dataset_count": len(request.datasets),
+                        "datasets": [f"{ds.project_id}.{ds.dataset_id}.{ds.table_id}" for ds in request.datasets],
+                        "plan_strategy": query_plan.strategy if query_plan else None,
+                        "plan_feasibility": query_plan.feasibility_score if query_plan else None,
+                        "llm_mode": request.llm_mode
+                    },
                     "queries": [],
                     "total_attempted": 0,
                     "total_validated": 0,
-                    "execution_time_ms": (time.time() - start_time) * 1000
+                    "execution_time_ms": (time.time() - start_time) * 1000,
+                    "suggestions": [
+                        "The LLM was unable to generate SQL from the query plan",
+                        "This may indicate the datasets lack necessary columns",
+                        "Try rephrasing the insight or using different datasets",
+                        "Check the query plan for potential issues"
+                    ]
                 }
                 return [TextContent(type="text", text=json.dumps(error_response, indent=2))]
             
@@ -264,7 +343,36 @@ class MCPHandlers:
                 
                 except Exception as e:
                     logger.error(f"Error processing candidate {i+1}: {e}", exc_info=True)
-                    warnings.append(f"Failed to process candidate {i+1}: {str(e)}")
+                    error_detail = f"Failed to process candidate {i+1}: {str(e)}"
+                    warnings.append(error_detail)
+                    
+                    # If ALL candidates fail with exceptions, we should return an error
+                    # Check if this is the last candidate and all have failed
+                    if i == len(candidates) - 1 and not validated_queries:
+                        # All candidates failed with exceptions
+                        error_response = {
+                            "error": "All query candidates failed during processing",
+                            "error_type": "validation_error",
+                            "error_details": "All candidates encountered errors during refinement and validation",
+                            "context": {
+                                "insight": request.insight[:200],
+                                "dataset_count": len(request.datasets),
+                                "datasets": [f"{ds.project_id}.{ds.dataset_id}.{ds.table_id}" for ds in request.datasets],
+                                "candidates_attempted": len(candidates)
+                            },
+                            "queries": [],
+                            "total_attempted": len(candidates),
+                            "total_validated": 0,
+                            "execution_time_ms": (time.time() - start_time) * 1000,
+                            "warnings": warnings,
+                            "suggestions": [
+                                "All query candidates failed during refinement",
+                                "This may indicate issues with BigQuery connectivity or permissions",
+                                "Check BigQuery access and query validator logs",
+                                "Verify datasets are accessible and contain expected data"
+                            ]
+                        }
+                        return [TextContent(type="text", text=json.dumps(error_response, indent=2))]
             
             # Derive project_name from target_table_name
             project_name = None
@@ -329,13 +437,39 @@ class MCPHandlers:
             return [TextContent(type="text", text=json.dumps(response_json, indent=2))]
             
         except Exception as e:
-            logger.error(f"Error in handle_generate_queries: {e}", exc_info=True)
+            logger.error(f"Unexpected error in handle_generate_queries: {e}", exc_info=True)
+            
+            # Extract as much context as possible
+            context = {
+                "error_type": type(e).__name__,
+                "error_location": "handle_generate_queries"
+            }
+            
+            # Try to get insight and datasets if request was parsed
+            try:
+                if "insight" in arguments:
+                    context["insight"] = arguments.get("insight", "")[:200]
+                if "datasets" in arguments:
+                    context["dataset_count"] = len(arguments.get("datasets", []))
+                if "dataset_ids" in arguments:
+                    context["dataset_ids_requested"] = arguments.get("dataset_ids", [])
+            except Exception:
+                pass  # Don't fail while building error context
+            
             error_response = {
-                "error": f"Internal error: {str(e)}",
+                "error": "Unexpected internal error during query generation",
+                "error_type": "internal_error",
+                "error_details": str(e),
+                "context": context,
                 "queries": [],
                 "total_attempted": 0,
                 "total_validated": 0,
-                "execution_time_ms": (time.time() - start_time) * 1000
+                "execution_time_ms": (time.time() - start_time) * 1000,
+                "suggestions": [
+                    "This is an unexpected error - check the query-generation-agent logs",
+                    "The error may be due to invalid input format or system issues",
+                    "Contact support if the issue persists"
+                ]
             }
             return [TextContent(type="text", text=json.dumps(error_response, indent=2))]
     
@@ -350,53 +484,87 @@ class MCPHandlers:
             Validated GenerateQueriesRequest
             
         Raises:
-            ValueError: If arguments are invalid
+            ValueError: If arguments are invalid with detailed error message
         """
-        # Parse datasets
-        datasets_data = arguments.get("datasets", [])
-        datasets = []
-        
-        for ds_data in datasets_data:
-            # Map data-discovery-agent output to our DatasetMetadata model
-            dataset = DatasetMetadata(
-                project_id=ds_data.get("project_id"),
-                dataset_id=ds_data.get("dataset_id"),
-                table_id=ds_data.get("table_id"),
-                asset_type=ds_data.get("asset_type", ds_data.get("table_type", "TABLE")),
-                description=ds_data.get("description"),
-                row_count=ds_data.get("row_count"),
-                size_bytes=ds_data.get("size_bytes"),
-                column_count=ds_data.get("column_count"),
-                created=ds_data.get("created"),
-                last_modified=ds_data.get("last_modified"),
-                insert_timestamp=ds_data.get("insert_timestamp"),
-                schema=ds_data.get("schema", []),
-                column_profiles=ds_data.get("column_profiles", []),
-                lineage=ds_data.get("lineage", []),
-                analytical_insights=ds_data.get("analytical_insights", []),
-                key_metrics=ds_data.get("key_metrics", []),
-                full_markdown=ds_data.get("full_markdown", ""),
-                has_pii=ds_data.get("has_pii", False),
-                has_phi=ds_data.get("has_phi", False),
-                environment=ds_data.get("environment"),
-                owner_email=ds_data.get("owner_email"),
-                tags=ds_data.get("tags", [])
+        try:
+            # Validate required fields
+            if "insight" not in arguments:
+                raise ValueError(
+                    "Missing required field 'insight'. "
+                    "The insight parameter is required and should contain the natural language query."
+                )
+            
+            if "datasets" not in arguments or not arguments["datasets"]:
+                raise ValueError(
+                    "Missing or empty 'datasets' field. "
+                    "At least one dataset is required for query generation. "
+                    "Datasets should be provided as a list of dataset metadata objects."
+                )
+            
+            # Parse datasets
+            datasets_data = arguments.get("datasets", [])
+            datasets = []
+            
+            for i, ds_data in enumerate(datasets_data):
+                # Validate dataset structure
+                required_ds_fields = ["project_id", "dataset_id", "table_id"]
+                missing_fields = [f for f in required_ds_fields if not ds_data.get(f)]
+                if missing_fields:
+                    raise ValueError(
+                        f"Dataset at index {i} is missing required fields: {', '.join(missing_fields)}. "
+                        f"Each dataset must have project_id, dataset_id, and table_id."
+                    )
+                
+                # Map data-discovery-agent output to our DatasetMetadata model
+                dataset = DatasetMetadata(
+                    project_id=ds_data.get("project_id"),
+                    dataset_id=ds_data.get("dataset_id"),
+                    table_id=ds_data.get("table_id"),
+                    asset_type=ds_data.get("asset_type", ds_data.get("table_type", "TABLE")),
+                    description=ds_data.get("description"),
+                    row_count=ds_data.get("row_count"),
+                    size_bytes=ds_data.get("size_bytes"),
+                    column_count=ds_data.get("column_count"),
+                    created=ds_data.get("created"),
+                    last_modified=ds_data.get("last_modified"),
+                    insert_timestamp=ds_data.get("insert_timestamp"),
+                    schema=ds_data.get("schema", []),
+                    column_profiles=ds_data.get("column_profiles", []),
+                    lineage=ds_data.get("lineage", []),
+                    analytical_insights=ds_data.get("analytical_insights", []),
+                    key_metrics=ds_data.get("key_metrics", []),
+                    full_markdown=ds_data.get("full_markdown", ""),
+                    has_pii=ds_data.get("has_pii", False),
+                    has_phi=ds_data.get("has_phi", False),
+                    environment=ds_data.get("environment"),
+                    owner_email=ds_data.get("owner_email"),
+                    tags=ds_data.get("tags", [])
+                )
+                datasets.append(dataset)
+            
+            # Build request
+            request = GenerateQueriesRequest(
+                insight=arguments["insight"],
+                datasets=datasets,
+                max_queries=arguments.get("max_queries", 3),
+                max_iterations=arguments.get("max_iterations", self.config.max_query_iterations),
+                require_alignment_check=arguments.get("require_alignment_check", True),
+                allow_cross_dataset=arguments.get("allow_cross_dataset", True),
+                llm_mode=arguments.get("llm_mode", "fast_llm"),
+                stop_on_first_valid=arguments.get("stop_on_first_valid", False)
             )
-            datasets.append(dataset)
-        
-        # Build request
-        request = GenerateQueriesRequest(
-            insight=arguments["insight"],
-            datasets=datasets,
-            max_queries=arguments.get("max_queries", 3),
-            max_iterations=arguments.get("max_iterations", self.config.max_query_iterations),
-            require_alignment_check=arguments.get("require_alignment_check", True),
-            allow_cross_dataset=arguments.get("allow_cross_dataset", True),
-            llm_mode=arguments.get("llm_mode", "fast_llm"),
-            stop_on_first_valid=arguments.get("stop_on_first_valid", False)
-        )
-        
-        return request
+            
+            return request
+            
+        except ValueError:
+            # Re-raise ValueError with context
+            raise
+        except Exception as e:
+            # Wrap other exceptions with context
+            raise ValueError(
+                f"Failed to parse generate_queries request: {str(e)}. "
+                f"Check that all required fields are present and have valid values."
+            ) from e
     
     def _generate_failure_diagnostic_markdown(
         self,
@@ -808,17 +976,39 @@ class MCPHandlers:
             return [TextContent(type="text", text=json.dumps(response.model_dump(), indent=2))]
             
         except Exception as e:
-            logger.error(f"Error generating views: {e}", exc_info=True)
-            error_response = GenerateQueriesResponse(
-                queries=[],
-                total_attempted=0,
-                total_validated=0,
-                execution_time_ms=(time.time() - start_time) * 1000,
-                insight="Generate views from PRP Section 9",
-                dataset_count=0,
-                warnings=[f"Error: {str(e)}"]
-            )
-            return [TextContent(type="text", text=json.dumps(error_response.model_dump(), indent=2))]
+            logger.error(f"Unexpected error generating views: {e}", exc_info=True)
+            
+            # Extract context
+            context = {
+                "error_type": type(e).__name__,
+                "error_location": "handle_generate_views"
+            }
+            
+            try:
+                if "prp_markdown" in arguments:
+                    context["prp_length"] = len(arguments.get("prp_markdown", ""))
+                if "source_datasets" in arguments:
+                    context["dataset_count"] = len(arguments.get("source_datasets", []))
+            except Exception:
+                pass
+            
+            error_response = {
+                "error": "Unexpected error during view generation",
+                "error_type": "internal_error",
+                "error_details": str(e),
+                "context": context,
+                "queries": [],
+                "total_attempted": 0,
+                "total_validated": 0,
+                "execution_time_ms": (time.time() - start_time) * 1000,
+                "suggestions": [
+                    "This is an unexpected error - check the query-generation-agent logs",
+                    "Verify the PRP markdown format is correct",
+                    "Ensure source datasets are properly formatted",
+                    "Contact support if the issue persists"
+                ]
+            }
+            return [TextContent(type="text", text=json.dumps(error_response, indent=2))]
     
     def _parse_views_request(self, arguments: Dict[str, Any]) -> GenerateViewsRequest:
         """

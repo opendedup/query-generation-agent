@@ -74,15 +74,11 @@ class QueryIdeator:
         
         # Merge explicit + parsed context
         all_examples = (example_queries or []) + insight_context.example_queries
-        all_dataset_refs = (previous_datasets or []) + insight_context.referenced_datasets
         
-        logger.info(f"Context extraction: {len(all_examples)} SQL examples, {len(all_dataset_refs)} dataset references")
-        
-        # Prioritize datasets based on references
-        prioritized_datasets = self._prioritize_datasets(datasets, all_dataset_refs, insight_context)
+        logger.info(f"Context extraction: {len(all_examples)} SQL examples")
         
         # Convert datasets to dict format for Gemini client
-        dataset_dicts = self._prepare_datasets(prioritized_datasets)
+        dataset_dicts = self._prepare_datasets(datasets)
         
         # Generate queries using Gemini with enriched context
         success, error_msg, queries, usage = self.gemini_client.generate_queries(
@@ -543,56 +539,4 @@ Generate 1 query that implements this plan.
             })
         
         return analysis
-    
-    def _prioritize_datasets(
-        self,
-        datasets: List[DatasetMetadata],
-        referenced_names: List[str],
-        insight_context: Any
-    ) -> List[DatasetMetadata]:
-        """
-        Prioritize datasets based on references in insight.
-        
-        Datasets explicitly mentioned in the insight are moved to the front of the list.
-        This helps the LLM focus on the most relevant tables.
-        
-        Args:
-            datasets: All available datasets
-            referenced_names: Dataset/table names mentioned in insight
-            insight_context: Parsed insight context
-            
-        Returns:
-            Reordered list with priority datasets first
-        """
-        if not referenced_names:
-            logger.info("No dataset references found, using original order")
-            return datasets
-        
-        priority_datasets = []
-        other_datasets = []
-        
-        for dataset in datasets:
-            full_id = dataset.get_full_table_id().lower()
-            table_id = dataset.table_id.lower()
-            
-            # Check if this dataset is referenced
-            is_referenced = any(
-                ref.lower() in full_id or 
-                ref.lower() in table_id or
-                table_id in ref.lower()
-                for ref in referenced_names
-            )
-            
-            if is_referenced:
-                priority_datasets.append(dataset)
-                logger.info(f"✓ Prioritizing dataset: {dataset.get_full_table_id()}")
-            else:
-                other_datasets.append(dataset)
-        
-        if priority_datasets:
-            logger.info(f"Prioritized {len(priority_datasets)} datasets, {len(other_datasets)} others")
-        else:
-            logger.info("No matching datasets found for references, using original order")
-        
-        return priority_datasets + other_datasets
 

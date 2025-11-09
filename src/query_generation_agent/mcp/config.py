@@ -31,6 +31,13 @@ class QueryGenerationConfig(BaseSettings):
     # API Keys
     gemini_api_key: str = Field(..., description="Gemini API key", alias="GEMINI_API_KEY")
     
+    # Data Discovery Agent Configuration
+    discovery_agent_url: str = Field(
+        default="http://localhost:8080",
+        description="Data Discovery Agent HTTP endpoint",
+        alias="DISCOVERY_AGENT_URL",
+    )
+    
     # Query Generation Configuration
     max_query_iterations: int = Field(
         default=5,

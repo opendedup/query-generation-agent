@@ -21,10 +21,12 @@ The Query Generation Agent is a Model Context Protocol (MCP) service that takes 
 
 JSON payload containing:
 - **insight**: The data science question or requirement to satisfy
-- **datasets**: Array of dataset metadata from data-discovery-agent
-  - project_id, dataset_id, table_id
-  - Schema information with field descriptions
-  - Full markdown documentation
+- **dataset_ids**: Array of dataset identifiers (fetched automatically from data-discovery-agent)
+  - project_id: GCP project ID
+  - dataset_id: BigQuery dataset ID
+  - table_id: BigQuery table ID
+
+The agent automatically fetches full dataset metadata (schemas, descriptions, profiles, etc.) from the data-discovery-agent via HTTP.
 
 ### Output Format
 
@@ -81,6 +83,7 @@ See `.env.example` for all available configuration options. Key variables:
 
 - `GCP_PROJECT_ID`: Your Google Cloud Project ID
 - `GEMINI_API_KEY`: Gemini API key for query generation
+- `DISCOVERY_AGENT_URL`: Data Discovery Agent HTTP endpoint (default: http://localhost:8080)
 - `MAX_QUERY_ITERATIONS`: Maximum refinement attempts (default: 10)
 - `ALIGNMENT_THRESHOLD`: Minimum score for query acceptance (default: 0.85)
 
@@ -281,6 +284,65 @@ query-generation-agent/
 ├── tests/                # Test suites
 ├── examples/             # Usage examples
 └── docs/                 # Additional documentation
+```
+
+## Migration Guide
+
+### Breaking Change: Dataset IDs Instead of Full Datasets
+
+**Version 2.0** introduces a breaking change to simplify the API and ensure dataset metadata is always fresh.
+
+#### What Changed
+
+The `datasets` parameter has been replaced with `dataset_ids`. Instead of passing full dataset metadata, you now pass just the identifiers, and the agent fetches the latest metadata from the data-discovery-agent automatically.
+
+#### Before (v1.x)
+
+```python
+await query_gen_client.generate_queries(
+    insight="What are the top 10 customers by revenue?",
+    datasets=[
+        {
+            "project_id": "my-project",
+            "dataset_id": "analytics",
+            "table_id": "customers",
+            "schema": [...],  # 50+ fields of metadata
+            "column_profiles": [...],
+            "lineage": [...],
+            # ... many more fields
+        }
+    ]
+)
+```
+
+#### After (v2.0)
+
+```python
+await query_gen_client.generate_queries(
+    insight="What are the top 10 customers by revenue?",
+    dataset_ids=[
+        {
+            "project_id": "my-project",
+            "dataset_id": "analytics",
+            "table_id": "customers"
+        }
+    ]
+)
+```
+
+#### Benefits
+
+- **Simpler API**: 3 fields instead of 50+ per dataset
+- **Always Fresh**: Metadata always comes from the source of truth
+- **Reduced Payload**: Initial request is much smaller
+- **Single Responsibility**: Discovery agent owns all dataset metadata
+
+#### Configuration Required
+
+Ensure `DISCOVERY_AGENT_URL` is set in your `.env` file (default: `http://localhost:8080`):
+
+```bash
+DISCOVERY_AGENT_URL=http://localhost:8080
 ```
 
 ## License

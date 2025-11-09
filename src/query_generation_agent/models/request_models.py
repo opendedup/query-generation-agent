@@ -28,9 +28,6 @@ class InsightContext:
     # Extracted SQL examples from insight
     example_queries: List[str] = field(default_factory=list)
     
-    # Referenced dataset/table names found in insight
-    referenced_datasets: List[str] = field(default_factory=list)
-    
     # Query pattern keywords (e.g., "cohort", "time-series", "pivot")
     pattern_keywords: List[str] = field(default_factory=list)
     
